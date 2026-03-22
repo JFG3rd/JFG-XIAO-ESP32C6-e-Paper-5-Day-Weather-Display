@@ -203,4 +203,4 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 
 ## License
 
-Choose your license and add `LICENSE` if you plan to publish.
+This project is licensed under the **Apache License 2.0**. See `LICENSE`.
