@@ -109,6 +109,18 @@ Open the control page at `http://<device-ip>/`:
 - Language selector (EN/DE/ES/FR)
 - Logs and status
 
+## Language Selection
+
+The **same language setting** controls both the **web UI** and the **e‑paper display** (labels, weekdays, and status text).
+
+How to change it:
+
+1. Open the web UI at `http://<device-ip>/`
+2. Use the **Language** dropdown in the header
+3. The page reloads and the e‑paper display updates immediately
+
+Available languages: **English, German, Spanish, French**.
+
 ---
 
 ## Static IP Setup
