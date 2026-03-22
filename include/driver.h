@@ -1,0 +1,9 @@
+#pragma once
+
+#ifndef BOARD_SCREEN_COMBO
+#define BOARD_SCREEN_COMBO 512
+#endif
+
+#ifndef USE_XIAO_EPAPER_DRIVER_BOARD
+#define USE_XIAO_EPAPER_DRIVER_BOARD
+#endif
