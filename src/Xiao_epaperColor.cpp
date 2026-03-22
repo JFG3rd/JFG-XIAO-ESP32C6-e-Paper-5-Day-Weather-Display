@@ -310,8 +310,8 @@ const UiText kUiText[] = {
         "DNS 1",
         "DNS 2",
         {"SO", "MO", "DI", "MI", "DO", "FR", "SA"},
-        {"SONNE", "KLAR", "TEIL", "WOLKIG", "NEBEL", "REGEN", "STARK", "SCHAU", "GEWITER", "NIESEL", "SCHNEE", "MIX",
-         "HAGEL", "EIS", "HAGEL", "WIND", "W+R"},
+        {"SONNE", "KLAR", "TEIL", "WOLKIG", "NEBEL", "REGEN", "STARK", "SCHAUER", "GEWITER", "NIESEL", "SCHNEE", "MIX",
+         "GRAUPEL", "EIS", "HAGEL", "WIND", "W+R"},
     },
     {
         "es",
@@ -980,14 +980,12 @@ void drawFreeFontCenteredTemp(int value, int32_t x, int32_t y, const GFXfont* fo
   epaper.setTextDatum(MC_DATUM);
   epaper.drawString(text, x, y);
 
-  int16_t x1 = 0;
-  int16_t y1 = 0;
-  uint16_t w = 0;
-  uint16_t h = 0;
-  epaper.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-  const int16_t left = x - static_cast<int16_t>(w / 2) - x1;
-  const int16_t top = y - static_cast<int16_t>(h / 2) - y1;
-  drawDegreeSymbol(left + w + 2, top + 2, 2, fg);
+  // textWidth works with the currently selected free font.
+  const uint16_t w = epaper.textWidth(text);
+  const uint16_t h = (font != nullptr) ? font->yAdvance : 12;
+  const int16_t left = x - static_cast<int16_t>(w / 2);
+  const int16_t top = y - static_cast<int16_t>(h / 2);
+  drawDegreeSymbol(left + w + 5, top + 9, 2, fg);
 
   epaper.setTextDatum(TL_DATUM);
   epaper.setFreeFont(nullptr);

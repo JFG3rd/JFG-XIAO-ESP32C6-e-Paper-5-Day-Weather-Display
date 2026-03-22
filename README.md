@@ -3,6 +3,8 @@
 Build a crisp, low‑power 4‑color (black/white/yellow/red) weather dashboard on the **Seeed Studio XIAO ESP32‑C6** with the **2.9" 128×296 BWRY e‑paper panel** and the **Seeed XIAO ePaper driver board**.  
 This project focuses on a reliable, repeatable workflow: correct controller selection, correct pin mapping, and a proven render path.
 
+![XIAO e‑paper weather display](assets/readme-display.png)
+
 ## Why This Is Worth Building
 
 - **Always‑on, almost‑no‑power**: e‑paper only consumes power while refreshing.
@@ -190,4 +192,3 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 ## License
 
 Choose your license and add `LICENSE` if you plan to publish.
-
