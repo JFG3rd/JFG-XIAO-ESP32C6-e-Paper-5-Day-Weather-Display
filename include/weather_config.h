@@ -2,9 +2,11 @@
 
 namespace weather_config
 {
-// Fill in your local Wi-Fi credentials before flashing.
-inline constexpr char kWifiSsid[] = "MBUmain";
-inline constexpr char kWifiPassword[] = "84351504002357674640";
+// Compile-time Wi-Fi defaults. Leave empty to force AP-mode onboarding.
+// If you do set these, keep them out of version control (e.g. use a
+// gitignored local_config.h that overrides these values).
+inline constexpr char kWifiSsid[] = "";
+inline constexpr char kWifiPassword[] = "";
 
 // Fixed Berlin defaults for this hardware profile.
 inline constexpr float kDefaultLatitude = 52.5200f;

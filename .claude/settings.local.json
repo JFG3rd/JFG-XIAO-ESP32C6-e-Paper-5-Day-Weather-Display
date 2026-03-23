@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -s https://raw.githubusercontent.com/JFG3rd/HomeKitKnock-S3/main/data/style.css)",
+      "Bash(curl -s https://raw.githubusercontent.com/JFG3rd/HomeKitKnock-S3/main/data/index.html)"
+    ]
+  }
+}

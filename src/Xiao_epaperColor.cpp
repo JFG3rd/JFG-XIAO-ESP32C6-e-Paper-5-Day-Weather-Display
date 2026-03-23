@@ -7,7 +7,7 @@
 #include <TFT_eSPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
 #include <time.h>
 
 // Bold free fonts are provided by Seeed_GFX (LOAD_GFXFF in the user setup).
@@ -40,8 +40,8 @@ constexpr uint8_t kWifiConnectAttempts = 3;
 constexpr uint8_t kMaxReconnectFailuresBeforeAp = 3;
 constexpr byte kDnsPort = 53;
 constexpr const char* kPrefsNamespace = "wifi";
-constexpr const char* kApSsid = "XIAO-Weather-Setup";
-constexpr const char* kStaHostname = "xiao-weather";
+constexpr const char* kApSsid = "JFG-XIAO-Weather-Setup";
+constexpr const char* kStaHostname = "jfg-xiao-weather";
 
 Preferences preferences;
 DNSServer dnsServer;
@@ -61,6 +61,11 @@ uint8_t reconnectFailures = 0;
 uint8_t lastDisconnectReason = 0;
 uint32_t lastScanCacheMs = 0;
 bool scanInProgress = false;
+// Pre-built captive portal HTML. Rebuilt when the AP starts, language changes,
+// or the user triggers a rescan. Serving this cached string avoids ~100ms of
+// String.replace() work per request, which would starve DNS processing and
+// cause Apple CNA to time out.
+String cachedCaptivePage;
 
 String currentSsid;
 String currentPassword;
@@ -210,7 +215,7 @@ const UiText kUiText[] = {
     {
         "en",
         "English",
-        "XIAO Weather Control",
+        "JFG-XIAO Weather Control",
         "Status",
         "Wi-Fi Setup",
         "Logs",
@@ -263,7 +268,7 @@ const UiText kUiText[] = {
     {
         "de",
         "Deutsch",
-        "XIAO Wetter",
+        "JFG-XIAO Wetter",
         "Status",
         "WLAN Setup",
         "Logs",
@@ -292,7 +297,7 @@ const UiText kUiText[] = {
         "Nicht geladen",
         "Aktualisiert",
         "WLAN",
-        "XIAO Wetter Setup",
+        "JFG-XIAO Wetter Setup",
         "Verbinde das Display mit deinem WLAN. Diese Seite ist fuer Apple Captive Portal optimiert.",
         "Sichtbare Netzwerke",
         "Versteckte oder manuelle SSID",
@@ -345,7 +350,7 @@ const UiText kUiText[] = {
         "No cargado",
         "Actualizado",
         "WiFi",
-        "XIAO Weather Setup",
+        "JFG-XIAO Weather Setup",
         "Conecta la pantalla a tu Wi-Fi. Esta pagina esta optimizada para Apple captive portal.",
         "Redes visibles",
         "SSID oculta o manual",
@@ -398,7 +403,7 @@ const UiText kUiText[] = {
         "Non charge",
         "Mis a jour",
         "WiFi",
-        "XIAO Weather Setup",
+        "JFG-XIAO Weather Setup",
         "Connectez l'ecran a votre Wi-Fi. Page optimisee pour le captive portal Apple.",
         "Reseaux visibles",
         "SSID masque ou manuel",
@@ -623,10 +628,13 @@ void upsertScanCacheEntry(const String& ssid, int32_t rssi, int32_t channel, con
   scanCacheCount++;
 }
 
+// Escape for safe embedding in both JSON strings and HTML attribute values.
+// Without HTML entity escaping, a malicious SSID like <script>alert(1)</script>
+// would execute in the captive portal page (built via buildCaptiveScanOptions).
 String jsonEscape(const String& input)
 {
   String output;
-  output.reserve(input.length() + 8);
+  output.reserve(input.length() + 16);
   for (size_t i = 0; i < input.length(); ++i) {
     const char c = input[i];
     if (c == '\\' || c == '"') {
@@ -634,6 +642,14 @@ String jsonEscape(const String& input)
       output += c;
     } else if (c == '\n') {
       output += "\\n";
+    } else if (c == '<') {
+      output += "&lt;";
+    } else if (c == '>') {
+      output += "&gt;";
+    } else if (c == '&') {
+      output += "&amp;";
+    } else if (c == '\'') {
+      output += "&#39;";
     } else if (c >= 0x20) {
       output += c;
     }
@@ -750,7 +766,7 @@ bool updateClock(const char* timezone, ForecastData& forecast)
 
 String buildForecastUrl(const Coordinates& coordinates)
 {
-  String url = F("https://api.open-meteo.com/v1/forecast?");
+  String url = F("http://api.open-meteo.com/v1/forecast?");
   url += F("latitude=");
   url += String(coordinates.latitude, 4);
   url += F("&longitude=");
@@ -813,8 +829,12 @@ bool fetchForecast(ForecastData& forecast)
 
   addLog("Requesting Open-Meteo forecast.");
 
-  WiFiClientSecure client;
-  client.setInsecure();
+  // Use plain HTTP for the public Open-Meteo API. The previous code used HTTPS
+  // with setInsecure() which disabled certificate verification entirely —
+  // providing no actual security while wasting ~40KB of heap for the TLS stack.
+  // Open-Meteo returns only public weather data (no auth tokens or secrets),
+  // so plain HTTP is acceptable and more reliable on constrained devices.
+  WiFiClient client;
   HTTPClient http;
   http.setTimeout(kHttpTimeoutMs);
   if (!http.begin(client, url)) {
@@ -1309,6 +1329,7 @@ void clearCredentials()
 }
 
 void stopApMode();
+void rebuildCaptivePageCache();
 
 void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info)
 {
@@ -1454,7 +1475,10 @@ void prepareStaMode()
 {
   WiFi.persistent(false);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
+  // Disable ESP-IDF auto-reconnect to prevent it from racing with our manual
+  // reconnect logic. When both fire simultaneously, neither succeeds because
+  // each tears down the other's in-progress association.
+  WiFi.setAutoReconnect(false);
   WiFi.setHostname(kStaHostname);
   applyStaticIpConfig();
   WiFi.mode(WIFI_STA);
@@ -1475,6 +1499,37 @@ bool waitForStaConnection(uint32_t timeoutMs)
     }
     delay(250);
   }
+  return false;
+}
+
+// Lightweight reconnect: reuses existing STA mode and skips full teardown.
+// Used by the loop() reconnect path to avoid resetting the WiFi stack, which
+// causes the ESP-IDF state machine to lose its association context.
+bool reconnectWifi(const String& ssid, const String& password)
+{
+  if (ssid.isEmpty()) {
+    return false;
+  }
+
+  // Only disconnect the STA link, don't erase stored config (false, false)
+  // so the radio stays initialized and the mode stays WIFI_STA.
+  staGotIp = false;
+  WiFi.disconnect(false, false);
+  // Brief settle time for the disconnect event to propagate through the
+  // ESP-IDF event loop before we call begin() again.
+  delay(200);
+
+  addLog(String("Reconnecting to Wi-Fi SSID: ") + ssid);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  if (waitForStaConnection(kWifiTimeoutMs)) {
+    reconnectFailures = 0;
+    lastReconnectAttemptMs = millis();
+    addLog(String("Wi-Fi reconnected. IP: ") + WiFi.localIP().toString());
+    return true;
+  }
+
+  addLog(String("Wi-Fi reconnect failed, status=") + wifiStatusLabel(WiFi.status()));
   return false;
 }
 
@@ -1503,7 +1558,11 @@ bool connectToWifi(const String& ssid, const String& password, bool allowScanInf
     staGotIp = false;
     addLog(String("Connecting to Wi-Fi SSID: ") + ssid + " (attempt " + attempt + "/" + kWifiConnectAttempts + ")");
     WiFi.disconnect(true, true);
-    delay(120);
+    // Wait for the disconnect event to propagate through ESP-IDF before
+    // calling begin(). Without this, the STA state machine can enter begin()
+    // while still tearing down the previous association, causing the new
+    // connection attempt to silently fail.
+    delay(200);
     if (targetNetwork != nullptr && targetNetwork->channel > 0) {
       // Use channel + BSSID pinning when available to avoid hopping across APs.
       WiFi.begin(ssid.c_str(), password.c_str(), targetNetwork->channel, targetNetwork->bssid, true);
@@ -1560,7 +1619,20 @@ void startApMode()
 {
   WiFi.disconnect(true, true);
   delay(100);
-  WiFi.mode(WIFI_AP_STA);
+
+  // Pre-populate the scan cache BEFORE starting the AP. We do this in STA mode
+  // so the scan doesn't interfere with AP clients (no one is connected yet).
+  // This ensures buildCaptivePage() has network data without blocking during
+  // the critical window when Apple CNA is probing.
+  WiFi.mode(WIFI_STA);
+  refreshScanCacheSync();
+  WiFi.disconnect(false, false);
+  delay(50);
+
+  // Now switch to pure AP mode. Using WIFI_AP (not AP_STA) dedicates the single
+  // ESP32-C6 radio to serving AP clients — no background STA scanning that
+  // takes the radio offline and starves DNS/HTTP responses.
+  WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(kApSsid)) {
     addLog("Failed to start AP mode.");
     renderErrorScreen("AP failed", "Restart device");
@@ -1568,16 +1640,21 @@ void startApMode()
   }
 
   apModeActive = true;
+  // Start DNS immediately after softAP — Apple CNA sends its first DNS probe
+  // within ~200ms of WiFi association. If DNS doesn't reply in time, CNA
+  // silently gives up and never shows the captive portal sheet.
   dnsServer.start(kDnsPort, "*", WiFi.softAPIP());
-  // Kick off an async scan so the captive portal can render quickly.
-  startScanCacheRefreshAsync();
   if (!serverStarted) {
     server.begin();
     serverStarted = true;
     addLog("HTTP control server started in AP mode.");
   }
+
   addLog(String("AP mode active. Connect to SSID: ") + kApSsid);
   addLog(String("AP IP: ") + WiFi.softAPIP().toString());
+  // Pre-build the captive page HTML once so that request handlers can serve it
+  // instantly (<1ms) without blocking the loop with String.replace() work.
+  rebuildCaptivePageCache();
   renderSetupScreen(ui().wifiSetupTitle,
                     String(ui().accessPoint) + ": " + kApSsid,
                     String(ui().deviceIp) + ": " + WiFi.softAPIP().toString());
@@ -1629,6 +1706,19 @@ String buildStatusJson()
   json += jsonEscape(String(currentForecast.updatedDay) + " " + currentForecast.updatedAt);
   json += "\",\"language\":\"";
   json += kUiText[static_cast<uint8_t>(currentLanguage)].code;
+  // Include live network config so the main page JS can pre-fill the static IP
+  // fields with the current DHCP-assigned values (gateway, subnet, DNS).
+  const bool isConnected = (WiFi.status() == WL_CONNECTED);
+  json += "\",\"dhcpIp\":\"";
+  json += isConnected ? WiFi.localIP().toString() : String("");
+  json += "\",\"dhcpGw\":\"";
+  json += isConnected ? WiFi.gatewayIP().toString() : String("");
+  json += "\",\"dhcpSubnet\":\"";
+  json += isConnected ? WiFi.subnetMask().toString() : String("");
+  json += "\",\"dhcpDns1\":\"";
+  json += isConnected ? WiFi.dnsIP(0).toString() : String("");
+  json += "\",\"dhcpDns2\":\"";
+  json += isConnected ? WiFi.dnsIP(1).toString() : String("");
   json += "\"}";
   return json;
 }
@@ -1788,6 +1878,17 @@ String buildMainPage()
         <div>${ui.statusReason}</div><div>${status.disconnectReason || '-'}</div>
         <div>${ui.statusForecast}</div><div>${status.forecastValid ? ui.forecastValid : ui.forecastMissing}</div>
         <div>${ui.statusUpdated}</div><div>${status.updated || '-'}</div>`;
+      // When static IP is not enabled, pre-fill the network config fields with
+      // the current DHCP-assigned values so the user only needs to tweak the IP.
+      const cb = document.getElementById('static_enabled');
+      if (cb && !cb.checked && status.wifiConnected) {
+        const fill = (id, val) => { const el = document.getElementById(id); if (el && !el.value) el.value = val || ''; };
+        fill('static_ip', status.dhcpIp);
+        fill('static_gw', status.dhcpGw);
+        fill('static_subnet', status.dhcpSubnet);
+        fill('static_dns1', status.dhcpDns1);
+        fill('static_dns2', status.dhcpDns2);
+      }
     }
     async function updateLogs() {
       const logs = await fetchJson('/logs');
@@ -1876,11 +1977,16 @@ String buildMainPage()
   page.replace("{{STATIC_IP_SUBNET}}", t.staticIpSubnet);
   page.replace("{{STATIC_IP_DNS1}}", t.staticIpDns1);
   page.replace("{{STATIC_IP_DNS2}}", t.staticIpDns2);
-  page.replace("{{STATIC_IP_VALUE}}", staticIpConfig.ip.toString());
-  page.replace("{{STATIC_GW_VALUE}}", staticIpConfig.gateway.toString());
-  page.replace("{{STATIC_SUBNET_VALUE}}", staticIpConfig.subnet.toString());
-  page.replace("{{STATIC_DNS1_VALUE}}", staticIpConfig.dns1.toString());
-  page.replace("{{STATIC_DNS2_VALUE}}", staticIpConfig.dns2.toString());
+  // When static IP is configured, show those saved values. Otherwise, pre-fill
+  // with the current DHCP-assigned network config so the user only needs to
+  // change the IP address to switch to static.
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+  const bool useStatic = staticIpConfig.enabled && static_cast<uint32_t>(staticIpConfig.ip) != 0;
+  page.replace("{{STATIC_IP_VALUE}}", useStatic ? staticIpConfig.ip.toString() : (connected ? WiFi.localIP().toString() : String("")));
+  page.replace("{{STATIC_GW_VALUE}}", useStatic ? staticIpConfig.gateway.toString() : (connected ? WiFi.gatewayIP().toString() : String("")));
+  page.replace("{{STATIC_SUBNET_VALUE}}", useStatic ? staticIpConfig.subnet.toString() : (connected ? WiFi.subnetMask().toString() : String("")));
+  page.replace("{{STATIC_DNS1_VALUE}}", useStatic ? staticIpConfig.dns1.toString() : (connected ? WiFi.dnsIP(0).toString() : String("")));
+  page.replace("{{STATIC_DNS2_VALUE}}", useStatic ? staticIpConfig.dns2.toString() : (connected ? WiFi.dnsIP(1).toString() : String("")));
   page.replace("{{SUMMARY_AP}}", t.summaryAp);
   page.replace("{{SUMMARY_STA}}", t.summarySta);
   page.replace("{{SUMMARY_CONNECTED}}", t.summaryConnected);
@@ -1996,6 +2102,11 @@ String buildCaptivePage()
   return page;
 }
 
+void rebuildCaptivePageCache()
+{
+  cachedCaptivePage = buildCaptivePage();
+}
+
 bool isAppleCaptiveRequest()
 {
   const String userAgent = server.header("User-Agent");
@@ -2005,8 +2116,12 @@ bool isAppleCaptiveRequest()
 void handleRoot()
 {
   server.sendHeader("Cache-Control", "no-store");
-  if (apModeActive && isAppleCaptiveRequest()) {
-    server.send(200, "text/html", buildCaptivePage());
+  if (apModeActive) {
+    // In AP mode, always serve the lightweight captive setup page at "/".
+    // The full control page (buildMainPage) triggers /scan, /status, /logs
+    // fetches that all block the loop — unacceptable during CNA detection.
+    // Users can still reach the full page at "/" once in station mode.
+    server.send(200, "text/html", cachedCaptivePage);
     return;
   }
   server.send(200, "text/html", buildMainPage());
@@ -2024,8 +2139,19 @@ void handleStatus()
 
 void handleScan()
 {
-  // Explicit rescan for the full control UI.
-  refreshScanCacheSync();
+  // Explicit rescan for the full control UI. In AP mode we need to temporarily
+  // switch to AP_STA to perform the scan, then switch back to pure AP.
+  if (apModeActive) {
+    WiFi.mode(WIFI_AP_STA);
+    refreshScanCacheSync();
+    WiFi.mode(WIFI_AP);
+    dnsServer.stop();
+    dnsServer.start(kDnsPort, "*", WiFi.softAPIP());
+    // Rebuild cached HTML so the new network list appears on the next page load.
+    rebuildCaptivePageCache();
+  } else {
+    refreshScanCacheSync();
+  }
   server.send(200, "application/json", buildScanJson());
 }
 
@@ -2044,14 +2170,33 @@ void handleSaveWiFi()
     server.send(400, "text/plain", "SSID cannot be empty");
     return;
   }
+  // IEEE 802.11 limits SSID to 32 bytes and WPA2 passphrase to 63 characters.
+  // Reject oversized input to prevent NVS overflow and potential buffer issues.
+  if (ssid.length() > 32 || password.length() > 63) {
+    server.send(400, "text/plain", "SSID (max 32) or password (max 63) too long");
+    return;
+  }
 
   if (!lang.isEmpty() && isLanguageCodeSupported(lang)) {
     saveLanguagePreference(lang);
     addLog(String("Language set to ") + lang + " via setup API.");
   }
 
+  // Extract and persist the static IP configuration sent by the main page JS.
+  // These fields are populated from the form inputs (static_enabled, static_ip, etc.).
+  const bool staticEnabled = doc["staticEnabled"] | false;
+  const String staticIp = doc["staticIp"].as<String>();
+  const String staticGw = doc["staticGw"].as<String>();
+  const String staticSubnet = doc["staticSubnet"].as<String>();
+  const String staticDns1 = doc["staticDns1"].as<String>();
+  const String staticDns2 = doc["staticDns2"].as<String>();
+  saveStaticIpConfig(staticEnabled, staticIp, staticGw, staticSubnet, staticDns1, staticDns2);
+
   saveCredentials(ssid, password);
   addLog(String("Saved Wi-Fi credentials for SSID: ") + ssid);
+  if (staticEnabled) {
+    addLog(String("Static IP config saved: ") + staticIp);
+  }
   server.send(200, "text/plain", "Wi-Fi credentials saved. Device will reboot.");
   delay(500);
   ESP.restart();
@@ -2064,6 +2209,10 @@ void handleSaveWiFiForm()
   const String lang = server.arg("language");
   if (ssid.isEmpty()) {
     server.send(400, "text/plain", "SSID cannot be empty");
+    return;
+  }
+  if (ssid.length() > 32 || password.length() > 63) {
+    server.send(400, "text/plain", "SSID (max 32) or password (max 63) too long");
     return;
   }
 
@@ -2101,6 +2250,9 @@ void handleLanguage()
     // Recompute the updated timestamp so localized weekday strings refresh too.
     updateClock(resolveCoordinates().timezone, currentForecast);
     renderForecast(currentForecast);
+  }
+  if (apModeActive) {
+    rebuildCaptivePageCache();
   }
   server.send(200, "text/plain", "Language updated.");
 }
@@ -2151,11 +2303,19 @@ void handleReboot()
   ESP.restart();
 }
 
+void handlePortal()
+{
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", cachedCaptivePage);
+}
+
 void handleNotFound()
 {
   if (apModeActive) {
+    // Serve the cached captive page for any unknown path. This catches OS
+    // captive probes we didn't explicitly register (e.g. Android variants).
     server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "text/html", buildCaptivePage());
+    server.send(200, "text/html", cachedCaptivePage);
     return;
   }
   server.send(404, "text/plain", "Not found");
@@ -2163,8 +2323,18 @@ void handleNotFound()
 
 void handleAppleCaptiveProbe()
 {
+  // Apple CNA sends GET /hotspot-detect.html and checks if the response body is
+  // exactly: <HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>
+  // If it matches → "internet works, no captive portal."
+  // If it does NOT match → "captive portal detected" → CNA opens a sheet showing
+  // the response body directly in the CNA WebKit sheet.
+  //
+  // We serve the pre-built captive page directly as HTTP 200. This is the fastest
+  // path: one DNS query → one HTTP response → CNA renders the form. No redirects,
+  // no meta-refresh, no second round-trip. The page is pre-cached in startApMode()
+  // so serving it takes <1ms (just sending the already-built String).
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/html", buildCaptivePage());
+  server.send(200, "text/html", cachedCaptivePage);
 }
 
 void handleConnectTestTxt()
@@ -2180,8 +2350,10 @@ void handleConnectTestTxt()
 void handleGenerate204()
 {
   if (apModeActive) {
+    // Android expects 204 for "internet works." Returning 200 with content
+    // triggers "sign in to network" notification → opens the portal browser.
     server.sendHeader("Cache-Control", "no-store");
-    server.send(200, "text/html", buildCaptivePage());
+    server.send(200, "text/html", cachedCaptivePage);
     return;
   }
   server.send(204, "text/plain", "");
@@ -2195,6 +2367,7 @@ void setupWebServer()
   const char* headers[] = {"User-Agent", "X-Requested-With"};
   server.collectHeaders(headers, 2);
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/portal", HTTP_GET, handlePortal);
   server.on("/hotspot-detect.html", HTTP_GET, handleAppleCaptiveProbe);
   server.on("/canonical.html", HTTP_GET, handleAppleCaptiveProbe);
   server.on("/library/test/success.html", HTTP_GET, handleAppleCaptiveProbe);
@@ -2221,6 +2394,7 @@ void setupRuntime()
   registerWiFiEvents();
   loadStoredCredentials();
   loadLanguagePreference();
+  loadStaticIpConfig();
   setupWebServer();
 
   // If no credentials were previously saved, prefer fast AP onboarding for Apple CNA.
@@ -2262,16 +2436,15 @@ void setup()
 
 void loop()
 {
+  if (apModeActive) {
+    // Process DNS BEFORE HTTP. DNS responses are tiny (~50 bytes, <1ms) but
+    // Apple CNA requires them within ~200ms of sending the query. If HTTP
+    // request handling (which can take tens of ms) runs first, DNS gets starved
+    // and CNA times out → portal never appears or takes minutes.
+    dnsServer.processNextRequest();
+  }
   if (serverStarted) {
     server.handleClient();
-  }
-  if (apModeActive) {
-    dnsServer.processNextRequest();
-    // Keep the scan cache fresh without blocking CNA.
-    pollScanCache();
-    if (!scanInProgress && (millis() - lastScanCacheMs) > kScanCacheTtlMs) {
-      startScanCacheRefreshAsync();
-    }
   }
 
   if (!apModeActive && WiFi.status() == WL_CONNECTED && forecastValid &&
@@ -2283,14 +2456,21 @@ void loop()
       (millis() - lastReconnectAttemptMs) > kReconnectCheckIntervalMs) {
     lastReconnectAttemptMs = millis();
     reconnectFailures++;
-    addLog(String("Wi-Fi reconnect check triggered (failure count ") + reconnectFailures + ").");
+    addLog(String("Wi-Fi reconnect attempt ") + reconnectFailures + "/" + kMaxReconnectFailuresBeforeAp);
 
-    if (connectToWifi(currentSsid, currentPassword, reconnectFailures == 1)) {
+    // Use the lightweight reconnect path: it reuses the existing STA mode
+    // instead of doing a full WiFi.mode() teardown, which avoids resetting
+    // the ESP-IDF association state machine mid-reconnect.
+    if (reconnectWifi(currentSsid, currentPassword)) {
       if (!forecastValid) {
         refreshForecastAndDisplay();
       }
     } else if (reconnectFailures >= kMaxReconnectFailuresBeforeAp) {
-      addLog("Repeated STA reconnect failures. Keeping saved credentials and continuing retry loop.");
+      // After repeated failures, fall back to AP mode so the user can
+      // reconfigure. The saved credentials are kept for the next boot.
+      addLog("Max reconnect failures reached. Falling back to AP mode.");
+      reconnectFailures = 0;
+      startApMode();
     }
   }
 }
