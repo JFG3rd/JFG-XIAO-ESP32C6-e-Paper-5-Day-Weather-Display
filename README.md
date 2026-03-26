@@ -1,6 +1,6 @@
 # XIAO 2.9" BWRY E‑Paper Weather Display
 
-Build a crisp, low‑power 4‑color (black/white/yellow/red) weather dashboard on the **Seeed Studio XIAO ESP32‑C6** with the **2.9" 128×296 BWRY e‑paper panel** and the **Seeed XIAO ePaper driver board**.  
+Build a crisp, low‑power 4‑color (black/white/yellow/red) weather dashboard on the **[Seeed Studio XIAO ESP32‑C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/)** with the **2.9" 128×296 BWRY e‑paper panel** and the **[Seeed XIAO ePaper driver board](https://wiki.seeedstudio.com/xiao_eink_expansion_board_v2/)**.  
 This project focuses on a reliable, repeatable workflow: correct controller selection, correct pin mapping, and a proven render path.
 
 ![XIAO e‑paper weather display](assets/readme-display.png)
