@@ -1,3 +1,4 @@
+#include <Adafruit_LC709203F.h>
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
@@ -5,9 +6,11 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
+#include <esp_sleep.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <Wire.h>
 #include <time.h>
 
 // Bold free fonts are provided by Seeed_GFX (LOAD_GFXFF in the user setup).
@@ -26,17 +29,33 @@ constexpr uint8_t kForecastDays = 5;
 constexpr uint8_t kMaxLogEntries = 24;
 constexpr uint8_t kMaxScanEntries = 16;
 constexpr uint16_t kHeaderHeight = 22;
+// Battery glyph drawn in the top-right of the header (body + terminal nub).
+constexpr uint16_t kBatteryIconWidth = 30;
+// Horizontal space reserved for the glyph, including the margin around it.
+constexpr uint16_t kBatteryIconMargin = kBatteryIconWidth + 8;
 // Tighten the gap so each day card is slightly wider.
 constexpr uint16_t kCellGap = 0;
-constexpr uint32_t kWifiTimeoutMs = 20000;
+constexpr uint32_t kWifiTimeoutMs = 12000;
 constexpr uint32_t kWifiAttemptDelayMs = 1200;
 constexpr uint32_t kReconnectCheckIntervalMs = 10000;
 constexpr uint32_t kScanCacheTtlMs = 30000;
 constexpr uint32_t kHttpTimeoutMs = 15000;
 constexpr uint32_t kNtpTimeoutMs = 10000;
-// Refresh forecast every 15 minutes to keep data current without aggressive polling.
-constexpr uint32_t kRefreshIntervalMs = 15UL * 60UL * 1000UL;
-constexpr uint8_t kWifiConnectAttempts = 3;
+// Refresh forecast every 30 minutes. Each cycle ends in deep sleep, so this is
+// also the wall-clock wake period (boot + fetch time is subtracted before sleeping).
+constexpr uint32_t kRefreshIntervalMs = 30UL * 60UL * 1000UL;
+// After every render the device stays awake this long so the web UI is reachable.
+// Any handled HTTP request pushes the deadline forward, so an open browser tab
+// keeps the device awake indefinitely.
+constexpr uint32_t kAwakeWindowMs = 2UL * 60UL * 1000UL;
+// A cold boot (power-on or reset) holds the device awake for longer: that is
+// when someone is most likely to be reaching for the web UI, and a 5 minute
+// floor means they never have to race the sleep timer.
+constexpr uint32_t kColdBootAwakeMs = 5UL * 60UL * 1000UL;
+// Shorter cycle when the forecast could not be fetched, so a transient outage
+// does not leave stale data on screen for a full half hour.
+constexpr uint32_t kRetrySleepMs = 5UL * 60UL * 1000UL;
+constexpr uint8_t kWifiConnectAttempts = 2;
 constexpr uint8_t kMaxReconnectFailuresBeforeAp = 3;
 constexpr byte kDnsPort = 53;
 constexpr const char* kPrefsNamespace = "wifi";
@@ -57,6 +76,11 @@ bool hasStoredCredentials = false;
 bool usingCompiledDefaults = false;
 uint32_t lastRefreshMs = 0;
 uint32_t lastReconnectAttemptMs = 0;
+// Deadline (millis) until which the device stays awake. Extended by web activity.
+uint32_t awakeUntilMs = 0;
+// Deep sleep can be disabled from the web UI to keep the device permanently
+// reachable for debugging. Persisted in NVS so it survives the sleep/reboot cycle.
+bool deepSleepEnabled = true;
 uint8_t reconnectFailures = 0;
 uint8_t lastDisconnectReason = 0;
 uint32_t lastScanCacheMs = 0;
@@ -127,6 +151,20 @@ struct StaticIpConfig
 };
 
 StaticIpConfig staticIpConfig = {};
+
+struct BatteryStatus
+{
+  // false when no sense hardware is present, i.e. nothing was measured.
+  bool valid = false;
+  float volts = 0.0f;
+  uint8_t percent = 0;
+};
+
+BatteryStatus currentBattery = {};
+
+// I2C LiPo fuel gauge on D4/D5. See docs/wire-diagram.md.
+Adafruit_LC709203F batteryGauge;
+bool batteryGaugeReady = false;
 
 enum class WeatherVisual
 {
@@ -207,6 +245,10 @@ struct UiText
   const char* staticIpSubnet;
   const char* staticIpDns1;
   const char* staticIpDns2;
+  const char* statusBattery;
+  const char* batteryUnknown;
+  const char* sleepModeLabel;
+  const char* sleepModeHint;
   const char* weekday[7];
   const char* weatherLabel[17];
 };
@@ -261,6 +303,10 @@ const UiText kUiText[] = {
         "Subnet",
         "DNS 1",
         "DNS 2",
+        "Battery",
+        "No sensor",
+        "Deep sleep between updates",
+        "Off keeps this page always reachable.",
         {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"},
         {"SUN", "CLEAR", "PARTLY", "CLOUD", "FOG", "RAIN", "HEAVY", "SHOWERS", "STORM", "DRIZZLE", "SNOW", "MIXED", "SLEET",
          "ICE", "HAIL", "WIND", "WIND+R"},
@@ -314,6 +360,10 @@ const UiText kUiText[] = {
         "Subnetz",
         "DNS 1",
         "DNS 2",
+        "Batterie",
+        "Kein Sensor",
+        "Tiefschlaf zwischen Updates",
+        "Aus haelt diese Seite dauerhaft erreichbar.",
         {"SO", "MO", "DI", "MI", "DO", "FR", "SA"},
         {"SONNE", "KLAR", "TEIL", "WOLKIG", "NEBEL", "REGEN", "STARK", "SCHAUER", "GEWITER", "NIESEL", "SCHNEE", "MIX",
          "GRAUPEL", "EIS", "HAGEL", "WIND", "W+R"},
@@ -367,6 +417,10 @@ const UiText kUiText[] = {
         "Subred",
         "DNS 1",
         "DNS 2",
+        "Bateria",
+        "Sin sensor",
+        "Suspension entre actualizaciones",
+        "Desactivado mantiene esta pagina siempre accesible.",
         {"DOM", "LUN", "MAR", "MIE", "JUE", "VIE", "SAB"},
         {"SOL", "CLARO", "PARC", "NUBE", "NIEB", "LLUV", "FUERTE", "CHUB", "TORM", "LLOV", "NIEVE", "MIX",
          "SLEET", "HIELO", "GRAN", "VIEN", "V+L"},
@@ -420,6 +474,10 @@ const UiText kUiText[] = {
         "Sous-reseau",
         "DNS 1",
         "DNS 2",
+        "Batterie",
+        "Pas de capteur",
+        "Veille profonde entre les mises a jour",
+        "Desactive garde cette page toujours accessible.",
         {"DIM", "LUN", "MAR", "MER", "JEU", "VEN", "SAM"},
         {"SOLEIL", "CLAIR", "PART", "NUAGE", "BROU", "PLUIE", "FORT", "AVERS", "ORAGE", "BRUI", "NEIGE", "MIX",
          "SLEET", "GLACE", "GRELE", "VENT", "V+P"},
@@ -539,8 +597,15 @@ const __FlashStringHelper* disconnectReasonLabel(uint8_t reason)
 
 void addLog(const String& message)
 {
-  Serial.println(message);
-  logBuffer[logWriteIndex] = message;
+  uint32_t sec = millis() / 1000;
+  uint8_t h = (sec / 3600) % 100;
+  uint8_t m = (sec % 3600) / 60;
+  uint8_t s = sec % 60;
+  char ts[10];
+  snprintf(ts, sizeof(ts), "%02u:%02u:%02u ", h, m, s);
+  String stamped = String(ts) + message;
+  Serial.println(stamped);
+  logBuffer[logWriteIndex] = stamped;
   logWriteIndex = (logWriteIndex + 1) % kMaxLogEntries;
 }
 
@@ -1052,6 +1117,129 @@ void renderSetupScreen(const String& title, const String& line1, const String& l
   epaper.update();
 }
 
+// Translate the configured pack capacity into the gauge's APA profile constant.
+// The LC709203F only accepts these fixed sizes; anything else is a config error.
+lc709203_adjustment_t batteryPackProfile(uint16_t packMah)
+{
+  switch (packMah) {
+    case 100:
+      return LC709203F_APA_100MAH;
+    case 200:
+      return LC709203F_APA_200MAH;
+    case 500:
+      return LC709203F_APA_500MAH;
+    case 1000:
+      return LC709203F_APA_1000MAH;
+    case 2000:
+      return LC709203F_APA_2000MAH;
+    case 3000:
+      return LC709203F_APA_3000MAH;
+    default:
+      return LC709203F_APA_1000MAH;
+  }
+}
+
+// Bring up the LC709203F on the free D4/D5 I2C pins. Called once per wake cycle
+// (deep sleep resets the MCU, but the gauge itself stays powered and keeps
+// tracking the pack, so its state-of-charge estimate survives across cycles).
+// coldBoot is true for a power-on or reset, false when waking from deep sleep.
+void setupBatteryGauge(bool coldBoot)
+{
+  batteryGaugeReady = false;
+  if (!weather_config::kBatteryGaugeEnabled) {
+    return;
+  }
+
+  Wire.begin(weather_config::kBatterySdaPin, weather_config::kBatterySclPin);
+  if (!batteryGauge.begin(&Wire)) {
+    addLog("Battery gauge not found on I2C (checked address 0x0B).");
+    return;
+  }
+
+  batteryGauge.setPackSize(batteryPackProfile(weather_config::kBatteryPackMah));
+  if (weather_config::kBatteryThermistorB > 0) {
+    batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_THERMISTOR);
+    batteryGauge.setThermistorB(weather_config::kBatteryThermistorB);
+  } else {
+    // No NTC on the pack: keep the gauge on its internal I2C temperature register.
+    batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_I2C);
+  }
+  // Keep the gauge running between updates. Operating mode costs ~15 uA (versus
+  // ~0.2 uA asleep), which is negligible next to the rest of the board, and it
+  // lets the RSOC algorithm keep tracking the pack while the MCU is asleep.
+  batteryGauge.setPowerMode(LC709203F_POWER_OPERATE);
+
+  if (coldBoot) {
+    // Re-seed the charge estimate from the open-circuit voltage. Only on a cold
+    // boot: doing it on every wake would throw away the gauge's own tracking.
+    batteryGauge.initRSOC();
+  }
+
+  batteryGaugeReady = true;
+  addLog(String("Battery gauge ready (IC version 0x") + String(batteryGauge.getICversion(), HEX) + ").");
+}
+
+// Single seam for battery state. Returns valid = false when the gauge is absent
+// or unreadable, which the display and web UI render as "no sensor".
+BatteryStatus readBattery()
+{
+  BatteryStatus status = {};
+  if (!batteryGaugeReady) {
+    return status;
+  }
+
+  const float volts = batteryGauge.cellVoltage();
+  const float percent = batteryGauge.cellPercent();
+  // A disconnected pack (or a failed transfer) reads as NaN or a nonsense voltage.
+  if (isnan(volts) || isnan(percent) || volts < 2.0f || volts > 5.0f) {
+    return status;
+  }
+
+  status.valid = true;
+  status.volts = volts;
+  status.percent = static_cast<uint8_t>(constrain(percent, 0.0f, 100.0f) + 0.5f);
+  return status;
+}
+
+String batteryVoltsText(const BatteryStatus& battery)
+{
+  return String(battery.volts, 2);
+}
+
+// Battery glyph for the header: white outline, white interior so the overlaid
+// percentage stays legible, and a yellow (red when low) fill bar for the charge
+// level. Occupies kBatteryIconWidth x kBatteryIconHeight pixels from (x, y).
+void drawBatteryIcon(int32_t x, int32_t y, const BatteryStatus& battery)
+{
+  constexpr int32_t kBodyWidth = 28;
+  constexpr int32_t kBodyHeight = 13;
+  const int32_t interiorWidth = kBodyWidth - 2;
+  const int32_t interiorHeight = kBodyHeight - 2;
+
+  // Body outline plus the positive terminal nub on the right.
+  epaper.drawRect(x, y, kBodyWidth, kBodyHeight, TFT_WHITE);
+  epaper.fillRect(x + kBodyWidth, y + 4, 2, 5, TFT_WHITE);
+  epaper.fillRect(x + 1, y + 1, interiorWidth, interiorHeight, TFT_WHITE);
+
+  if (battery.valid) {
+    const int32_t fillWidth = (interiorWidth * battery.percent) / 100;
+    if (fillWidth > 0) {
+      const uint16_t fillColor =
+          (battery.percent <= weather_config::kBatteryLowPercent) ? TFT_RED : TFT_YELLOW;
+      epaper.fillRect(x + 1, y + 1, fillWidth, interiorHeight, fillColor);
+    }
+  }
+
+  // Single-argument setTextColor draws with a transparent background, so the
+  // digits sit on top of the fill bar instead of erasing it.
+  epaper.setTextColor(TFT_BLACK);
+  epaper.setTextDatum(TL_DATUM);
+  const String label = battery.valid ? String(battery.percent) : String("?");
+  epaper.drawCentreString(label, x + kBodyWidth / 2, y + 3, 1);
+  // Restore an opaque text color for the callers that follow.
+  epaper.setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
 // Draw the fixed top banner: city on the left, Wi-Fi and updated time right-aligned.
 // Keeping the banner black preserves contrast for the red/yellow/white text colors.
 void renderHeader(const ForecastData& forecast)
@@ -1062,22 +1250,29 @@ void renderHeader(const ForecastData& forecast)
   // Use a bold free font for the city name to improve legibility.
   drawFreeFontLeft(forecast.location, 4, 2, &FreeSansBold9pt7b, TFT_YELLOW, TFT_BLACK);
 
+  // The battery glyph owns the far right of the banner; both text lines stop
+  // short of it so nothing runs underneath.
+  drawBatteryIcon(displayWidth - kBatteryIconWidth - 4, 4, currentBattery);
+  const uint16_t textRightEdge = displayWidth - kBatteryIconMargin;
+
   // Right-align Wi-Fi status on the first header line to avoid overlap with the title.
   const String wifiName = currentSsid.isEmpty() ? String("AP") : currentSsid;
   const String ipText = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("--.--.--.--");
   const String wifiLabel = String(ui().labelWifi) + ": " + wifiName + " " + ipText;
   const uint16_t titleWidth = epaper.textWidth(forecast.location, 2);
-  const uint16_t wifiMaxWidth = (displayWidth > titleWidth + 12) ? (displayWidth - titleWidth - 12) : 0;
+  const uint16_t wifiMaxWidth =
+      (textRightEdge > titleWidth + 12) ? (textRightEdge - titleWidth - 12) : 0;
   // this is where the SSID is drawn, so use yellow to match the city name and stand out against the black banner.
   epaper.setTextColor(TFT_YELLOW, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(wifiLabel, wifiMaxWidth, 1), displayWidth - 4, 2, 1);
+  epaper.drawRightString(clampTextToWidth(wifiLabel, wifiMaxWidth, 1), textRightEdge, 2, 1);
 
   // Keep the location on the left and right-align the updated timestamp on the second line.
   const String updatedLabel = String(ui().labelUpdated) + ": " + forecast.updatedDay + " " + forecast.updatedAt;
   const uint16_t locationWidth = epaper.textWidth(forecast.location, 1);
-  const uint16_t updatedMaxWidth = (displayWidth > locationWidth + 12) ? (displayWidth - locationWidth - 12) : 0;
+  const uint16_t updatedMaxWidth =
+      (textRightEdge > locationWidth + 12) ? (textRightEdge - locationWidth - 12) : 0;
   epaper.setTextColor(TFT_WHITE, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(updatedLabel, updatedMaxWidth, 1), displayWidth - 4, 13, 1);
+  epaper.drawRightString(clampTextToWidth(updatedLabel, updatedMaxWidth, 1), textRightEdge, 13, 1);
 }
 
 // Draw a single forecast day card. Layout is tuned to avoid text overlap.
@@ -1176,6 +1371,7 @@ void loadStoredCredentials()
       currentPassword = preferences.getString("password", "");
     }
     preferences.end();
+    addLog(String("Loaded stored credentials: SSID=") + currentSsid + " pwd_len=" + currentPassword.length());
   }
 
   if (currentSsid.isEmpty() && strlen(weather_config::kWifiSsid) > 0) {
@@ -1208,6 +1404,48 @@ void saveLanguagePreference(const String& langCode)
   preferences.putString("lang", langCode);
   preferences.end();
   currentLanguage = languageFromCode(langCode);
+}
+
+// Load the deep sleep preference from NVS. Sleep is on by default; the toggle
+// exists so the device can be kept permanently reachable while debugging.
+void loadSleepPreference()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading sleep mode. Defaulting to enabled.");
+    deepSleepEnabled = true;
+    return;
+  }
+  deepSleepEnabled = preferences.getBool("sleep_on", true);
+  preferences.end();
+}
+
+void saveSleepPreference(bool enabled)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving sleep mode.");
+    return;
+  }
+  preferences.putBool("sleep_on", enabled);
+  preferences.end();
+  deepSleepEnabled = enabled;
+}
+
+// Hold the device awake for at least windowMs from now. The deadline only ever
+// moves forward, so a short window can never cut a longer one short (e.g. the
+// 5 minute cold-boot hold surviving the render's 2 minute window).
+void extendAwakeWindow(uint32_t windowMs)
+{
+  const uint32_t candidate = millis() + windowMs;
+  if (static_cast<int32_t>(candidate - awakeUntilMs) > 0) {
+    awakeUntilMs = candidate;
+  }
+}
+
+// Push back the deep sleep deadline. Called from every web handler so an open
+// browser tab (which polls /status every 8s) keeps the device awake.
+void noteWebActivity()
+{
+  extendAwakeWindow(kAwakeWindowMs);
 }
 
 String buildLanguageOptions()
@@ -1556,7 +1794,8 @@ bool connectToWifi(const String& ssid, const String& password, bool allowScanInf
 
   for (uint8_t attempt = 1; attempt <= kWifiConnectAttempts; ++attempt) {
     staGotIp = false;
-    addLog(String("Connecting to Wi-Fi SSID: ") + ssid + " (attempt " + attempt + "/" + kWifiConnectAttempts + ")");
+    addLog(String("Connecting to Wi-Fi SSID: ") + ssid + " (attempt " + attempt + "/" + kWifiConnectAttempts +
+           ", pwd_len=" + password.length() + (targetNetwork ? ", BSSID pinned" : "") + ")");
     WiFi.disconnect(true, true);
     // Wait for the disconnect event to propagate through ESP-IDF before
     // calling begin(). Without this, the STA state machine can enter begin()
@@ -1591,9 +1830,17 @@ bool connectToWifi(const String& ssid, const String& password, bool allowScanInf
       addLog(String("Disconnect reason detail: ") + disconnectReasonLabel(lastDisconnectReason));
     }
 
-    if (status == WL_CONNECT_FAILED || lastDisconnectReason == WIFI_REASON_AUTH_FAIL ||
-        lastDisconnectReason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT || lastDisconnectReason == WIFI_REASON_HANDSHAKE_TIMEOUT) {
-      addLog("Authentication or passphrase failure suspected.");
+    // 4WAY_TIMEOUT can be caused by BSSID pinning issues, radio interference,
+    // or wrong password. Clear BSSID target and retry without pinning before
+    // giving up. Only AUTH_FAIL is a definitive "wrong password" from the router.
+    if (lastDisconnectReason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+        lastDisconnectReason == WIFI_REASON_HANDSHAKE_TIMEOUT) {
+      addLog("4-way handshake failed. Will retry without BSSID pinning.");
+      targetNetwork = nullptr;
+    }
+
+    if (status == WL_CONNECT_FAILED || lastDisconnectReason == WIFI_REASON_AUTH_FAIL) {
+      addLog("Authentication failure — check password.");
       break;
     }
 
@@ -1620,19 +1867,15 @@ void startApMode()
   WiFi.disconnect(true, true);
   delay(100);
 
-  // Pre-populate the scan cache BEFORE starting the AP. We do this in STA mode
-  // so the scan doesn't interfere with AP clients (no one is connected yet).
-  // This ensures buildCaptivePage() has network data without blocking during
-  // the critical window when Apple CNA is probing.
-  WiFi.mode(WIFI_STA);
-  refreshScanCacheSync();
-  WiFi.disconnect(false, false);
-  delay(50);
-
-  // Now switch to pure AP mode. Using WIFI_AP (not AP_STA) dedicates the single
-  // ESP32-C6 radio to serving AP clients — no background STA scanning that
-  // takes the radio offline and starves DNS/HTTP responses.
+  // Start AP immediately — do NOT scan first. The blocking STA scan takes 2-5s
+  // and delays AP visibility, which causes Apple CNA to miss its ~200ms probe
+  // window. The captive page JS will trigger a delayed /scan request on load,
+  // which briefly switches to AP_STA mode to scan and then switches back.
   WiFi.mode(WIFI_AP);
+  // Let the ESP-IDF WiFi state machine settle after mode change. Without this,
+  // softAP() can cause the AP to bounce (start → stop → start) as the
+  // subsystem reinitializes, briefly hiding the SSID from clients.
+  delay(150);
   if (!WiFi.softAP(kApSsid)) {
     addLog("Failed to start AP mode.");
     renderErrorScreen("AP failed", "Restart device");
@@ -1706,10 +1949,18 @@ String buildStatusJson()
   json += jsonEscape(String(currentForecast.updatedDay) + " " + currentForecast.updatedAt);
   json += "\",\"language\":\"";
   json += kUiText[static_cast<uint8_t>(currentLanguage)].code;
+  json += "\",\"batteryValid\":";
+  json += currentBattery.valid ? "true" : "false";
+  json += ",\"batteryPercent\":";
+  json += String(currentBattery.percent);
+  json += ",\"batteryVolts\":\"";
+  json += currentBattery.valid ? batteryVoltsText(currentBattery) : String("");
+  json += "\",\"deepSleepEnabled\":";
+  json += deepSleepEnabled ? "true" : "false";
   // Include live network config so the main page JS can pre-fill the static IP
   // fields with the current DHCP-assigned values (gateway, subnet, DNS).
   const bool isConnected = (WiFi.status() == WL_CONNECTED);
-  json += "\",\"dhcpIp\":\"";
+  json += ",\"dhcpIp\":\"";
   json += isConnected ? WiFi.localIP().toString() : String("");
   json += "\",\"dhcpGw\":\"";
   json += isConnected ? WiFi.gatewayIP().toString() : String("");
@@ -1758,76 +2009,251 @@ String buildMainPage()
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{TITLE}}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 0; background: #101416; color: #eef2f4; }
-    header { background: #0b0f10; padding: 16px; border-bottom: 3px solid #e0b400; }
-    .lang-row { margin-top: 10px; max-width: 280px; }
-    h1 { margin: 0 0 8px 0; font-size: 22px; }
-    main { padding: 16px; display: grid; gap: 16px; }
-    .card { background: #182024; border: 1px solid #2f3c43; border-radius: 10px; padding: 16px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-    label { display: block; margin-top: 10px; margin-bottom: 4px; }
-    input, select, button { width: 100%; box-sizing: border-box; padding: 10px; border-radius: 8px; border: 1px solid #4a5c65; }
-    input, select { background: #f5f7f8; color: #111; }
-    button { background: #e0b400; color: #111; font-weight: bold; cursor: pointer; }
-    button.secondary { background: #2f3c43; color: #eef2f4; }
-    pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.4; max-height: 320px; overflow-y: auto; }
-    .mono { font-family: monospace; }
-    .status { display: grid; grid-template-columns: max-content 1fr; gap: 6px 10px; }
+    :root {
+      --page-bg: #f0b37e;
+      --page-text: #001F4D;
+      --card-bg: #ffffff;
+      --card-text: #1f2a3a;
+      --card-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      --card-title-color: #001F4D;
+      --card-title-glow: 0 0 12px #FF4500, 0 0 20px #B22222, 0 0 30px #660000;
+      --input-bg: #ffffff;
+      --input-text: #111;
+      --input-border: #ccc;
+      --label-text: #1f2a3a;
+      --info-bg: #f8f9fa;
+      --info-text: #1f2a3a;
+      --btn-bg: rgba(33,150,243,0.18);
+      --btn-text: #14243a;
+      --btn-border: rgb(33,150,243);
+      --btn-save-bg: rgba(33,150,243,0.18);
+      --btn-save-text: #14243a;
+      --btn-save-border: rgb(33,150,243);
+      --btn-danger-bg: rgba(244,67,54,0.18);
+      --btn-danger-text: #4a0d0a;
+      --btn-danger-border: rgb(244,67,54);
+      --btn-nav-bg: rgba(76,175,80,0.18);
+      --btn-nav-text: #0f4a22;
+      --btn-nav-border: rgb(76,175,80);
+      --log-bg: #0b2b5d;
+      --log-text: #f2f6ff;
+      --log-odd: #000;
+      --log-even: #001F4D;
+      --header-bg: var(--card-bg);
+      --header-border: var(--input-border);
+      --switch-off: #bbb;
+      --switch-on: #007bff;
+      --switch-thumb: #fff;
+    }
+    .dark-mode {
+      --page-bg: #222;
+      --page-text: #eee;
+      --card-bg: #333;
+      --card-text: #eee;
+      --card-shadow: 0 2px 8px rgba(0,0,0,0.35);
+      --card-title-color: #5AB1FF;
+      --input-bg: #444;
+      --input-text: #fff;
+      --input-border: #666;
+      --label-text: #eee;
+      --info-bg: #2a2a2a;
+      --info-text: #eee;
+      --btn-text: rgb(220,232,255);
+      --btn-danger-text: rgb(255,214,209);
+      --btn-nav-text: rgb(200,247,209);
+      --btn-save-text: rgb(220,232,255);
+      --log-bg: #0a2453;
+      --header-bg: #333;
+      --header-border: #444;
+      --switch-off: #555;
+    }
+    * { box-sizing: border-box; }
+    html { height: 100%; margin: 0; }
+    body {
+      font-family: "Arial Unicode MS", "Noto Sans", Arial, sans-serif;
+      margin: 0; padding: 0;
+      background: var(--page-bg); color: var(--page-text);
+      min-height: 100vh;
+    }
+    .page-header {
+      padding: 12px 20px;
+      background: var(--header-bg);
+      border-bottom: 1px solid var(--header-border);
+      display: flex; justify-content: space-between; align-items: center;
+      position: relative;
+    }
+    .header-left { text-align: left; }
+    h1 {
+      font-size: 1.5em; margin: 6px 0;
+      color: var(--card-title-color);
+      text-shadow: var(--card-title-glow);
+    }
+    #summary { font-size: 0.85em; margin-top: 2px; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    .lang-row select { padding: 6px 10px; border: 1px solid var(--input-border); border-radius: 4px; background: var(--input-bg); color: var(--input-text); font-size: 13px; }
+    .switch { position: relative; display: inline-block; width: 34px; height: 20px; }
+    .switch input { display: none; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: var(--switch-off); transition: .3s; border-radius: 10px; }
+    .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: var(--switch-thumb); transition: .3s; border-radius: 50%; }
+    input:checked + .slider { background: var(--switch-on); }
+    input:checked + .slider:before { transform: translateX(14px); }
+    .dashboard {
+      display: flex; gap: 20px; flex-wrap: wrap;
+      justify-content: center; align-items: flex-start;
+      max-width: 1200px; margin: 20px auto; padding: 0 20px;
+    }
+    .card {
+      flex: 1; min-width: 300px; max-width: 420px;
+      background: var(--card-bg); color: var(--card-text);
+      border-radius: 10px; padding: 16px;
+      box-shadow: var(--card-shadow);
+    }
+    .card-title {
+      font-size: 20px; margin: 0 0 12px 0;
+      color: var(--card-title-color);
+      text-shadow: var(--card-title-glow);
+    }
+    .card-group-title {
+      font-size: 16px; margin: 14px 0 6px;
+      color: var(--card-title-color);
+      text-shadow: 0 0 8px #FF4500, 0 0 18px #B22222, 0 0 24px #660000;
+    }
+    .info-grid { display: grid; gap: 8px; margin: 10px 0; }
+    .info-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px; background: var(--info-bg); border-radius: 5px;
+      font-size: 12px; color: var(--info-text);
+    }
+    .info-label { font-weight: bold; }
+    .info-value { font-family: monospace; }
+    /* Battery meter: outlined body with a nub on the right, mirroring the e-paper glyph. */
+    .battery { display: inline-flex; align-items: center; gap: 6px; }
+    .battery-body {
+      position: relative; width: 42px; height: 14px;
+      border: 1.5px solid currentColor; border-radius: 3px; padding: 1px;
+    }
+    .battery-body:after {
+      content: ""; position: absolute; right: -4px; top: 3px;
+      width: 2px; height: 6px; background: currentColor;
+    }
+    .battery-fill { height: 100%; background: #35b36a; border-radius: 1px; }
+    .battery-fill.low { background: #d9534f; }
+    .battery-unknown { opacity: 0.6; }
+    .sleep-row {
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+      margin-top: 10px; font-size: 12px; color: var(--info-text);
+    }
+    .sleep-hint { font-size: 11px; opacity: 0.75; margin-top: 4px; color: var(--info-text); }
+    label { display: block; margin: 10px 0 4px; font-size: 14px; color: var(--label-text); }
+    select, input, textarea {
+      width: 100%; padding: 10px; margin: 0;
+      border: 1px solid var(--input-border); border-radius: 4px;
+      background: var(--input-bg); color: var(--input-text);
+      font-size: 14px;
+    }
+    input[type="checkbox"] { width: 18px; height: 18px; accent-color: #5aa7ff; }
+    button, .button {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 100%; padding: 10px; margin: 0;
+      border: 0.8px solid var(--btn-border); border-radius: 4px;
+      background: var(--btn-bg); color: var(--btn-text);
+      font-size: 14px; font-weight: 700; cursor: pointer;
+      min-height: 44px;
+    }
+    .btn-save { background: var(--btn-save-bg); color: var(--btn-save-text); border-color: var(--btn-save-border); }
+    .btn-danger { background: var(--btn-danger-bg); color: var(--btn-danger-text); border-color: var(--btn-danger-border); }
+    .btn-nav { background: var(--btn-nav-bg); color: var(--btn-nav-text); border-color: var(--btn-nav-border); }
+    .button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+    .log-container {
+      background: var(--log-bg); color: var(--log-text);
+      border: 1px solid var(--input-border); border-radius: 6px;
+      max-height: 320px; overflow-y: auto; padding: 0;
+    }
+    .log-container pre {
+      margin: 0; padding: 10px; white-space: pre-wrap; word-break: break-word;
+      font-size: 12px; line-height: 1.5; font-family: monospace;
+    }
+    @media (max-width: 1000px) {
+      .dashboard { flex-direction: column; align-items: center; }
+      .card { width: 100%; max-width: 600px; }
+    }
+    @media (max-width: 600px) {
+      body { padding: 0; }
+      h1 { font-size: 1.3em; }
+      .dashboard { padding: 0 10px; }
+      .card { min-width: unset; }
+      .button-row { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <h1>{{TITLE}}</h1>
-    <div id="summary">{{LOADING_STATE}}</div>
-    <div class="lang-row">
-      <label for="language">{{LANGUAGE_LABEL}}</label>
-      <select id="language">{{LANGUAGE_OPTIONS}}</select>
+  <div class="page-header">
+    <div class="header-left">
+      <h1>{{TITLE}}</h1>
+      <div id="summary">{{LOADING_STATE}}</div>
     </div>
-  </header>
-  <main>
-    <section class="grid">
-      <div class="card">
-        <h2>{{STATUS_TITLE}}</h2>
-        <div id="status" class="status mono"></div>
+    <div class="header-right">
+      <div class="lang-row">
+        <select id="language">{{LANGUAGE_OPTIONS}}</select>
       </div>
-      <div class="card">
-        <h2>{{WIFI_SETUP_TITLE}}</h2>
-        <label for="ssid">{{SSID_LABEL}}</label>
-        <select id="ssid"></select>
-        <label for="manual_ssid">{{HIDDEN_SSID_LABEL}}</label>
-        <input id="manual_ssid" type="text" placeholder="Enter SSID manually">
-        <label for="password">{{PASSWORD_LABEL}}</label>
-        <input id="password" type="password" placeholder="WLAN password">
-        <h3 style="margin-top:16px;">{{STATIC_IP_TITLE}}</h3>
-        <label>
-          <input id="static_enabled" type="checkbox" style="width:auto; margin-right:8px;" {{STATIC_IP_CHECKED}}>
-          {{STATIC_IP_ENABLE}}
+      <label class="switch" title="Dark mode">
+        <input type="checkbox" id="darkToggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+  <div class="dashboard">
+    <div class="card">
+      <h2 class="card-title">{{STATUS_TITLE}}</h2>
+      <div id="status" class="info-grid"></div>
+      <div class="sleep-row">
+        <span>{{SLEEP_MODE_LABEL}}</span>
+        <label class="switch" title="{{SLEEP_MODE_LABEL}}">
+          <input type="checkbox" id="sleepToggle">
+          <span class="slider"></span>
         </label>
-        <label for="static_ip">{{STATIC_IP_ADDRESS}}</label>
-        <input id="static_ip" type="text" placeholder="192.168.1.50" value="{{STATIC_IP_VALUE}}">
-        <label for="static_gw">{{STATIC_IP_GATEWAY}}</label>
-        <input id="static_gw" type="text" placeholder="192.168.1.1" value="{{STATIC_GW_VALUE}}">
-        <label for="static_subnet">{{STATIC_IP_SUBNET}}</label>
-        <input id="static_subnet" type="text" placeholder="255.255.255.0" value="{{STATIC_SUBNET_VALUE}}">
-        <label for="static_dns1">{{STATIC_IP_DNS1}}</label>
-        <input id="static_dns1" type="text" placeholder="1.1.1.1" value="{{STATIC_DNS1_VALUE}}">
-        <label for="static_dns2">{{STATIC_IP_DNS2}}</label>
-        <input id="static_dns2" type="text" placeholder="8.8.8.8" value="{{STATIC_DNS2_VALUE}}">
-        <div class="grid">
-          <button onclick="saveWiFi()">{{SAVE_REBOOT}}</button>
-          <button class="secondary" onclick="scanNetworks()">{{RESCAN}}</button>
-        </div>
-        <div class="grid" style="margin-top:10px;">
-          <button class="secondary" onclick="refreshForecast()">{{REFRESH_FORECAST}}</button>
-          <button class="secondary" onclick="forgetWiFi()">{{FORGET_WIFI}}</button>
-        </div>
       </div>
-    </section>
-    <section class="card">
-      <h2>{{LOGS_TITLE}}</h2>
-      <pre id="logs">{{LOADING_LOGS}}</pre>
-    </section>
-  </main>
+      <div class="sleep-hint">{{SLEEP_MODE_HINT}}</div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{WIFI_SETUP_TITLE}}</h2>
+      <label for="ssid">{{SSID_LABEL}}</label>
+      <select id="ssid"></select>
+      <label for="manual_ssid">{{HIDDEN_SSID_LABEL}}</label>
+      <input id="manual_ssid" type="text" placeholder="Enter SSID manually">
+      <label for="password">{{PASSWORD_LABEL}}</label>
+      <input id="password" type="password" placeholder="WLAN password">
+      <h3 class="card-group-title">{{STATIC_IP_TITLE}}</h3>
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input id="static_enabled" type="checkbox" {{STATIC_IP_CHECKED}}>
+        {{STATIC_IP_ENABLE}}
+      </label>
+      <label for="static_ip">{{STATIC_IP_ADDRESS}}</label>
+      <input id="static_ip" type="text" placeholder="192.168.1.50" value="{{STATIC_IP_VALUE}}">
+      <label for="static_gw">{{STATIC_IP_GATEWAY}}</label>
+      <input id="static_gw" type="text" placeholder="192.168.1.1" value="{{STATIC_GW_VALUE}}">
+      <label for="static_subnet">{{STATIC_IP_SUBNET}}</label>
+      <input id="static_subnet" type="text" placeholder="255.255.255.0" value="{{STATIC_SUBNET_VALUE}}">
+      <label for="static_dns1">{{STATIC_IP_DNS1}}</label>
+      <input id="static_dns1" type="text" placeholder="1.1.1.1" value="{{STATIC_DNS1_VALUE}}">
+      <label for="static_dns2">{{STATIC_IP_DNS2}}</label>
+      <input id="static_dns2" type="text" placeholder="8.8.8.8" value="{{STATIC_DNS2_VALUE}}">
+      <div class="button-row">
+        <button class="btn-save" onclick="saveWiFi()">{{SAVE_REBOOT}}</button>
+        <button onclick="scanNetworks()">{{RESCAN}}</button>
+      </div>
+      <div class="button-row">
+        <button class="btn-nav" onclick="refreshForecast()">{{REFRESH_FORECAST}}</button>
+        <button class="btn-danger" onclick="forgetWiFi()">{{FORGET_WIFI}}</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{LOGS_TITLE}}</h2>
+      <div class="log-container">
+        <pre id="logs">{{LOADING_LOGS}}</pre>
+      </div>
+    </div>
+  </div>
   <script>
     const ui = {
       summaryAp: '{{SUMMARY_AP}}',
@@ -1843,12 +2269,40 @@ String buildMainPage()
       statusForecast: '{{STATUS_FORECAST}}',
       statusUpdated: '{{STATUS_UPDATED}}',
       forecastValid: '{{FORECAST_VALID}}',
-      forecastMissing: '{{FORECAST_MISSING}}'
+      forecastMissing: '{{FORECAST_MISSING}}',
+      statusBattery: '{{STATUS_BATTERY}}',
+      batteryUnknown: '{{BATTERY_UNKNOWN}}'
     };
+    let currentConnectedSsid = '';
+    // Dark mode
+    (function() {
+      const toggle = document.getElementById('darkToggle');
+      if (localStorage.getItem('darkMode') === '1') {
+        document.body.classList.add('dark-mode');
+        toggle.checked = true;
+      }
+      toggle.addEventListener('change', function() {
+        document.body.classList.toggle('dark-mode', this.checked);
+        localStorage.setItem('darkMode', this.checked ? '1' : '0');
+      });
+    })();
     async function fetchJson(path, options) {
       const response = await fetch(path, options);
       if (!response.ok) throw new Error(await response.text());
       return response.json();
+    }
+    function makeInfoItem(label, value) {
+      return `<div class="info-item"><span class="info-label">${label}</span><span class="info-value">${value}</span></div>`;
+    }
+    // Battery meter mirroring the e-paper glyph: outline plus a proportional fill.
+    function makeBatteryValue(status) {
+      if (!status.batteryValid) {
+        return `<span class="battery battery-unknown"><span class="battery-body"></span>${ui.batteryUnknown}</span>`;
+      }
+      const percent = Math.max(0, Math.min(100, status.batteryPercent || 0));
+      const low = percent <= {{BATTERY_LOW_PERCENT}} ? ' low' : '';
+      const volts = status.batteryVolts ? ` (${status.batteryVolts} V)` : '';
+      return `<span class="battery"><span class="battery-body"><span class="battery-fill${low}" style="width:${percent}%"></span></span>${percent}%${volts}</span>`;
     }
     async function scanNetworks() {
       const select = document.getElementById('ssid');
@@ -1865,21 +2319,32 @@ String buildMainPage()
         option.textContent = `${n.ssid} (${n.rssi} dBm)`;
         select.appendChild(option);
       });
+      // Auto-select current SSID after scan
+      if (currentConnectedSsid) {
+        for (const opt of select.options) {
+          if (opt.value === currentConnectedSsid) { opt.selected = true; break; }
+        }
+      }
     }
     async function updateStatus() {
       const status = await fetchJson('/status');
+      currentConnectedSsid = status.ssid || '';
       document.getElementById('summary').textContent =
         `${status.apMode ? ui.summaryAp : ui.summarySta} | ${status.wifiConnected ? ui.summaryConnected : ui.summaryNotConnected} | ${status.location || ui.summaryNoForecast}`;
-      document.getElementById('status').innerHTML = `
-        <div>${ui.statusSsid}</div><div>${status.ssid || '-'}</div>
-        <div>${ui.statusIp}</div><div>${status.ip || '-'}</div>
-        <div>${ui.statusApIp}</div><div>${status.apIp || '-'}</div>
-        <div>${ui.statusWifiState}</div><div>${status.wifiStatus || '-'}</div>
-        <div>${ui.statusReason}</div><div>${status.disconnectReason || '-'}</div>
-        <div>${ui.statusForecast}</div><div>${status.forecastValid ? ui.forecastValid : ui.forecastMissing}</div>
-        <div>${ui.statusUpdated}</div><div>${status.updated || '-'}</div>`;
-      // When static IP is not enabled, pre-fill the network config fields with
-      // the current DHCP-assigned values so the user only needs to tweak the IP.
+      document.getElementById('status').innerHTML =
+        makeInfoItem(ui.statusSsid, status.ssid || '-') +
+        makeInfoItem(ui.statusIp, status.ip || '-') +
+        makeInfoItem(ui.statusApIp, status.apIp || '-') +
+        makeInfoItem(ui.statusWifiState, status.wifiStatus || '-') +
+        makeInfoItem(ui.statusReason, status.disconnectReason || '-') +
+        makeInfoItem(ui.statusForecast, status.forecastValid ? ui.forecastValid : ui.forecastMissing) +
+        makeInfoItem(ui.statusUpdated, status.updated || '-') +
+        makeInfoItem(ui.statusBattery, makeBatteryValue(status));
+      const sleepToggle = document.getElementById('sleepToggle');
+      // Do not fight the user mid-click: only sync the toggle when it is idle.
+      if (sleepToggle && document.activeElement !== sleepToggle) {
+        sleepToggle.checked = !!status.deepSleepEnabled;
+      }
       const cb = document.getElementById('static_enabled');
       if (cb && !cb.checked && status.wifiConnected) {
         const fill = (id, val) => { const el = document.getElementById(id); if (el && !el.value) el.value = val || ''; };
@@ -1888,6 +2353,13 @@ String buildMainPage()
         fill('static_subnet', status.dhcpSubnet);
         fill('static_dns1', status.dhcpDns1);
         fill('static_dns2', status.dhcpDns2);
+      }
+      // Pre-select current SSID in dropdown
+      if (currentConnectedSsid) {
+        const sel = document.getElementById('ssid');
+        for (const opt of sel.options) {
+          if (opt.value === currentConnectedSsid) { opt.selected = true; break; }
+        }
       }
     }
     async function updateLogs() {
@@ -1909,14 +2381,8 @@ String buildMainPage()
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-          ssid,
-          password,
-          staticEnabled,
-          staticIp,
-          staticGw,
-          staticSubnet,
-          staticDns1,
-          staticDns2
+          ssid, password, staticEnabled,
+          staticIp, staticGw, staticSubnet, staticDns1, staticDns2
         })
       });
       alert(await response.text());
@@ -1940,10 +2406,18 @@ String buildMainPage()
       });
       location.reload();
     }
-    const languageSelect = document.getElementById('language');
-    if (languageSelect) {
-      languageSelect.addEventListener('change', setLanguage);
+    async function setSleepMode() {
+      const enabled = document.getElementById('sleepToggle').checked;
+      await fetch('/sleepMode', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled})
+      });
+      await updateStatus();
+      await updateLogs();
     }
+    document.getElementById('sleepToggle').addEventListener('change', setSleepMode);
+    document.getElementById('language').addEventListener('change', setLanguage);
     document.getElementById('manual_ssid').addEventListener('input', e => {
       if (e.target.value.trim()) {
         document.getElementById('ssid').value = e.target.value.trim();
@@ -1960,6 +2434,11 @@ String buildMainPage()
   page.replace("{{TITLE}}", t.title);
   page.replace("{{LOADING_STATE}}", t.loadingState);
   page.replace("{{STATUS_TITLE}}", t.statusTitle);
+  page.replace("{{STATUS_BATTERY}}", t.statusBattery);
+  page.replace("{{BATTERY_UNKNOWN}}", t.batteryUnknown);
+  page.replace("{{BATTERY_LOW_PERCENT}}", String(weather_config::kBatteryLowPercent));
+  page.replace("{{SLEEP_MODE_LABEL}}", t.sleepModeLabel);
+  page.replace("{{SLEEP_MODE_HINT}}", t.sleepModeHint);
   page.replace("{{WIFI_SETUP_TITLE}}", t.wifiSetupTitle);
   page.replace("{{LOGS_TITLE}}", t.logsTitle);
   page.replace("{{SSID_LABEL}}", t.ssidLabel);
@@ -2040,50 +2519,99 @@ String buildCaptivePage()
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{SETUP_TITLE}}</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif; margin: 0; background: #f5f5f7; color: #111; }
-    main { max-width: 560px; margin: 0 auto; padding: 18px; }
-    h1 { font-size: 24px; margin: 0 0 8px; }
-    p { line-height: 1.45; }
-    .card { background: #fff; border-radius: 14px; padding: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.12); margin-top: 14px; }
-    label { display: block; margin: 12px 0 6px; font-weight: 600; }
-    input, select, button { width: 100%; box-sizing: border-box; padding: 12px; border-radius: 10px; font-size: 16px; }
-    input, select { border: 1px solid #c7c7cc; }
-    button { margin-top: 14px; border: 0; background: #007aff; color: #fff; font-weight: 600; }
-    .hint { color: #555; font-size: 14px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-    a { color: #007aff; text-decoration: none; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Arial Unicode MS", "Noto Sans", -apple-system, Arial, sans-serif;
+      margin: 0; padding: 20px;
+      background: #f0b37e; color: #001F4D;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 420px; margin: 0 auto; padding: 20px;
+      background: #fff; border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    h1 {
+      font-size: 1.5em; margin: 0 0 8px;
+      color: #001F4D;
+      text-shadow: 0 0 12px #FF4500, 0 0 20px #B22222, 0 0 30px #660000;
+    }
+    p { line-height: 1.45; font-size: 14px; }
+    label { display: block; margin: 12px 0 4px; font-size: 14px; color: #1f2a3a; }
+    select, input {
+      width: 100%; padding: 10px;
+      border: 1px solid #ccc; border-radius: 4px;
+      background: #fff; color: #111; font-size: 14px;
+    }
+    input[type="password"] { font-family: monospace; }
+    button {
+      display: block; width: 100%; padding: 12px; margin-top: 14px;
+      border: 0.8px solid rgb(33,150,243); border-radius: 4px;
+      background: rgba(33,150,243,0.18); color: #14243a;
+      font-size: 14px; font-weight: 700; cursor: pointer;
+      min-height: 44px;
+    }
+    .hint { color: #666; font-size: 13px; margin: 8px 0 0; }
+    .hint a { color: #007bff; text-decoration: none; }
+    .mono { font-family: monospace; }
+    .info-section {
+      margin-top: 16px; padding-top: 12px;
+      border-top: 1px solid #eee;
+    }
   </style>
 </head>
 <body>
-  <main>
+  <div class="container">
     <h1>{{SETUP_TITLE}}</h1>
     <p>{{SETUP_INTRO}}</p>
-    <div class="card">
-      <form method="POST" action="/saveWiFiForm">
-        <label for="language">{{LANGUAGE_LABEL}}</label>
-        <select id="language" name="language">
+    <form method="POST" action="/saveWiFiForm">
+      <label for="language">{{LANGUAGE_LABEL}}</label>
+      <select id="language" name="language">
 {{LANGUAGE_OPTIONS}}
-        </select>
-        <label for="ssid_select">{{VISIBLE_NETWORKS}}</label>
-        <select id="ssid_select" name="ssid_select">
+      </select>
+      <label for="ssid_select">{{VISIBLE_NETWORKS}}</label>
+      <select id="ssid_select" name="ssid_select">
 )rawliteral";
   page += buildCaptiveScanOptions();
   page += R"rawliteral(
-        </select>
-        <label for="ssid_manual">{{MANUAL_SSID}}</label>
-        <input id="ssid_manual" name="ssid_manual" type="text" autocapitalize="none" autocorrect="off" placeholder="Enter SSID manually if needed">
-        <label for="password">{{PASSWORD_LABEL}}</label>
-        <input id="password" name="password" type="password" autocapitalize="none" autocorrect="off" placeholder="Router password">
-        <button type="submit">{{SAVE_AND_REBOOT}}</button>
-      </form>
-    </div>
-    <div class="card">
+      </select>
+      <label for="ssid_manual">{{MANUAL_SSID}}</label>
+      <input id="ssid_manual" name="ssid_manual" type="text" autocapitalize="none" autocorrect="off" placeholder="Enter SSID manually if needed">
+      <label for="password">{{PASSWORD_LABEL}}</label>
+      <input id="password" name="password" type="password" autocapitalize="none" autocorrect="off" placeholder="Router password">
+      <button type="submit">{{SAVE_AND_REBOOT}}</button>
+    </form>
+    <div class="info-section">
       <p class="hint"><a href="/hotspot-detect.html">{{RELOAD_CAPTIVE}}</a></p>
       <p class="hint"><a href="/">{{OPEN_FULL}}</a></p>
-      <p class="hint">{{ACCESS_POINT}}: <span class="mono">XIAO-Weather-Setup</span></p>
+      <p class="hint">{{ACCESS_POINT}}: <span class="mono">{{AP_SSID}}</span></p>
       <p class="hint">{{DEVICE_IP}}: <span class="mono">192.168.4.1</span></p>
     </div>
-  </main>
+  </div>
+  <script>
+    (function() {
+      var sel = document.getElementById('ssid_select');
+      if (sel && sel.options.length <= 1) {
+        // Delay the scan by 3 seconds so Apple CNA finishes its captive
+        // detection probes before we switch the radio to AP_STA for scanning.
+        // Without this delay, the /scan request blocks the loop for 2-5s,
+        // starving DNS/HTTP and causing CNA to give up.
+        setTimeout(function() {
+          sel.innerHTML = '<option value="">Scanning...</option>';
+          fetch('/scan').then(function(r) { return r.json(); }).then(function(nets) {
+            sel.innerHTML = '';
+            if (!nets.length) { sel.innerHTML = '<option value="">No networks found</option>'; return; }
+            nets.forEach(function(n) {
+              var o = document.createElement('option');
+              o.value = n.ssid;
+              o.textContent = n.ssid + ' (' + n.rssi + ' dBm)';
+              sel.appendChild(o);
+            });
+          }).catch(function() {});
+        }, 3000);
+      }
+    })();
+  </script>
 </body>
 </html>
 )rawliteral";
@@ -2099,6 +2627,7 @@ String buildCaptivePage()
   page.replace("{{DEVICE_IP}}", t.deviceIp);
   page.replace("{{LANGUAGE_LABEL}}", t.languageLabel);
   page.replace("{{LANGUAGE_OPTIONS}}", buildLanguageOptions());
+  page.replace("{{AP_SSID}}", kApSsid);
   return page;
 }
 
@@ -2115,6 +2644,7 @@ bool isAppleCaptiveRequest()
 
 void handleRoot()
 {
+  noteWebActivity();
   server.sendHeader("Cache-Control", "no-store");
   if (apModeActive) {
     // In AP mode, always serve the lightweight captive setup page at "/".
@@ -2129,16 +2659,20 @@ void handleRoot()
 
 void handleLogs()
 {
+  noteWebActivity();
   server.send(200, "application/json", buildLogsJson());
 }
 
 void handleStatus()
 {
+  noteWebActivity();
+  currentBattery = readBattery();
   server.send(200, "application/json", buildStatusJson());
 }
 
 void handleScan()
 {
+  noteWebActivity();
   // Explicit rescan for the full control UI. In AP mode we need to temporarily
   // switch to AP_STA to perform the scan, then switch back to pure AP.
   if (apModeActive) {
@@ -2157,6 +2691,7 @@ void handleScan()
 
 void handleSaveWiFi()
 {
+  noteWebActivity();
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "Invalid JSON");
@@ -2192,8 +2727,12 @@ void handleSaveWiFi()
   const String staticDns2 = doc["staticDns2"].as<String>();
   saveStaticIpConfig(staticEnabled, staticIp, staticGw, staticSubnet, staticDns1, staticDns2);
 
-  saveCredentials(ssid, password);
-  addLog(String("Saved Wi-Fi credentials for SSID: ") + ssid);
+  // If the password field is empty and the SSID matches the currently connected
+  // network, keep the existing password. This allows users to change only the
+  // static IP configuration without losing their WiFi credentials.
+  const String effectivePassword = (password.isEmpty() && ssid == currentSsid) ? currentPassword : password;
+  saveCredentials(ssid, effectivePassword);
+  addLog(String("Saved Wi-Fi credentials for SSID: ") + ssid + " (pwd len=" + effectivePassword.length() + ")");
   if (staticEnabled) {
     addLog(String("Static IP config saved: ") + staticIp);
   }
@@ -2204,6 +2743,7 @@ void handleSaveWiFi()
 
 void handleSaveWiFiForm()
 {
+  noteWebActivity();
   const String ssid = server.arg("ssid_manual").length() ? server.arg("ssid_manual") : server.arg("ssid_select");
   const String password = server.arg("password");
   const String lang = server.arg("language");
@@ -2222,7 +2762,7 @@ void handleSaveWiFiForm()
   }
 
   saveCredentials(ssid, password);
-  addLog(String("Saved Wi-Fi credentials from captive form for SSID: ") + ssid);
+  addLog(String("Saved Wi-Fi credentials from captive form for SSID: ") + ssid + " (pwd len=" + password.length() + ")");
   server.send(200, "text/html",
               "<!DOCTYPE html><html><body style='font-family:-apple-system,Helvetica,Arial,sans-serif;padding:24px;'>"
               "<h2>Wi-Fi saved</h2><p>The device will reboot and join your router.</p></body></html>");
@@ -2232,6 +2772,7 @@ void handleSaveWiFiForm()
 
 void handleLanguage()
 {
+  noteWebActivity();
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "text/plain", "Invalid JSON");
@@ -2259,6 +2800,7 @@ void handleLanguage()
 
 void handleForgetWiFi()
 {
+  noteWebActivity();
   clearCredentials();
   addLog("Stored Wi-Fi credentials erased.");
   server.send(200, "text/plain", "Wi-Fi credentials erased. Device will reboot.");
@@ -2268,6 +2810,11 @@ void handleForgetWiFi()
 
 bool refreshForecastAndDisplay()
 {
+  // Sample the battery before drawing so the header glyph matches this frame,
+  // and grant a fresh awake window so the web UI is reachable after an update.
+  currentBattery = readBattery();
+  noteWebActivity();
+
   if (WiFi.status() != WL_CONNECTED) {
     forecastValid = false;
     renderErrorScreen("Wi-Fi disconnected", "Forecast refresh unavailable");
@@ -2289,6 +2836,7 @@ bool refreshForecastAndDisplay()
 
 void handleRefresh()
 {
+  noteWebActivity();
   if (refreshForecastAndDisplay()) {
     server.send(200, "text/plain", "Forecast refreshed.");
   } else {
@@ -2296,8 +2844,27 @@ void handleRefresh()
   }
 }
 
+void handleSleepMode()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  if (!doc["enabled"].is<bool>()) {
+    server.send(400, "text/plain", "Missing 'enabled' flag");
+    return;
+  }
+
+  saveSleepPreference(doc["enabled"].as<bool>());
+  addLog(String("Deep sleep ") + (deepSleepEnabled ? "enabled." : "disabled."));
+  server.send(200, "text/plain", deepSleepEnabled ? "Deep sleep enabled." : "Deep sleep disabled.");
+}
+
 void handleReboot()
 {
+  noteWebActivity();
   server.send(200, "text/plain", "Rebooting.");
   delay(300);
   ESP.restart();
@@ -2384,9 +2951,35 @@ void setupWebServer()
   server.on("/language", HTTP_POST, handleLanguage);
   server.on("/forgetWiFi", HTTP_POST, handleForgetWiFi);
   server.on("/refresh", HTTP_POST, handleRefresh);
+  server.on("/sleepMode", HTTP_POST, handleSleepMode);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.onNotFound(handleNotFound);
   routesConfigured = true;
+}
+
+// Power down the panel and the radio, then sleep until the next update.
+// Deep sleep resets the chip, so the next cycle re-enters setup() from scratch;
+// the e-paper keeps showing the last frame throughout.
+void enterDeepSleep(uint32_t sleepMs)
+{
+  addLog(String("Entering deep sleep for ") + (sleepMs / 1000) + " s.");
+  Serial.flush();
+
+#ifdef EPAPER_ENABLE
+  // EPaper::update() already ends in DSLP, but a cycle that never rendered (or
+  // one that only errored) may leave the panel awake. sleep() is idempotent.
+  epaper.sleep();
+#endif
+
+  if (serverStarted) {
+    server.stop();
+    serverStarted = false;
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepMs) * 1000ULL);
+  esp_deep_sleep_start();
 }
 
 void setupRuntime()
@@ -2394,8 +2987,10 @@ void setupRuntime()
   registerWiFiEvents();
   loadStoredCredentials();
   loadLanguagePreference();
+  loadSleepPreference();
   loadStaticIpConfig();
   setupWebServer();
+  noteWebActivity();
 
   // If no credentials were previously saved, prefer fast AP onboarding for Apple CNA.
   if (!hasStoredCredentials && usingCompiledDefaults) {
@@ -2421,16 +3016,35 @@ void setupRuntime()
 }
 }  // namespace
 
+// Survives deep sleep (but not a power cycle or a hard reset). Used for logging
+// how the current wake cycle started.
+RTC_DATA_ATTR uint32_t rtcWakeCount = 0;
+
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
 #ifdef EPAPER_ENABLE
+  // Always take the full init path: it hardware-resets the panel and issues
+  // EPD_WAKEUP, which is required because the panel is left in DSLP across deep
+  // sleep while the freshly constructed EPaper object believes it is awake.
   epaper.begin();
 #endif
 
-  addLog("XIAO weather app booting.");
+  const bool coldBoot = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER);
+  if (coldBoot) {
+    rtcWakeCount = 0;
+    addLog("XIAO weather app booting.");
+  } else {
+    ++rtcWakeCount;
+    addLog(String("Woke from deep sleep (cycle ") + rtcWakeCount + ").");
+  }
+
+  // Hold off sleep for the full cold-boot window before anything else can arm a
+  // shorter one, so the web UI is always reachable for 5 minutes after a boot.
+  extendAwakeWindow(coldBoot ? kColdBootAwakeMs : kAwakeWindowMs);
+  setupBatteryGauge(coldBoot);
   setupRuntime();
 }
 
@@ -2472,5 +3086,16 @@ void loop()
       reconnectFailures = 0;
       startApMode();
     }
+  }
+
+  // Once the awake window expires, sleep until the next scheduled update. Never
+  // sleep in AP mode: the captive portal has to stay up for as long as the user
+  // needs it. A failed forecast retries sooner than the normal cycle.
+  if (deepSleepEnabled && !apModeActive && static_cast<int32_t>(millis() - awakeUntilMs) > 0) {
+    const uint32_t elapsedMs = millis();
+    const uint32_t cycleMs = forecastValid ? kRefreshIntervalMs : kRetrySleepMs;
+    // Subtract the time this wake cycle already burned so the render-to-render
+    // period stays at kRefreshIntervalMs rather than drifting by the boot time.
+    enterDeepSleep((cycleMs > elapsedMs) ? (cycleMs - elapsedMs) : 1000UL);
   }
 }

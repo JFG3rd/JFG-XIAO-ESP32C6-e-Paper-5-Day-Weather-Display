@@ -39,15 +39,34 @@ inline constexpr char kLocationLabel[] = "Berlin";
 
 ## Current Behavior
 
-On boot the firmware:
+On boot (and on every deep-sleep wake) the firmware:
 
 1. Connects to Wi-Fi
 2. Requests a 5-day Open-Meteo forecast for the configured coordinates
 3. Parses the daily arrays
 4. Rotates the panel into landscape mode
-5. Draws a 5-column forecast layout
+5. Draws a 5-column forecast layout, with a battery symbol in the header
 6. Updates the e-paper panel once
-7. Powers down Wi-Fi and puts the panel to sleep
+7. Stays awake ~2 minutes so the web UI is reachable (extended by any HTTP request)
+8. Powers down Wi-Fi, puts the panel to sleep, and deep sleeps until the next 30-minute mark
+
+A failed fetch shortens the cycle to 5 minutes. AP/captive-portal mode never sleeps, and the
+web UI has a toggle (persisted in NVS) to disable deep sleep entirely.
+
+A cold boot (power-on or reset) holds the device awake for 5 minutes instead of 2, so the web UI
+is reachable right after you switch the device on.
+
+## Battery Sensing
+
+Battery state comes from an Adafruit LC709203F I2C fuel gauge on D4/D5 - the driver board never
+routes `BAT_4V2` to the XIAO and the ESP32-C6 has no free ADC pin. Wiring and bring-up steps are in
+[wire-diagram.md](/Users/jessegreene/Documents/PlatformIO/Projects/Xiao_epaperColor/docs/wire-diagram.md);
+the `kBattery*` constants live in
+[weather_config.h](/Users/jessegreene/Documents/PlatformIO/Projects/Xiao_epaperColor/include/weather_config.h).
+
+`setupBatteryGauge()` configures the gauge once per wake cycle and `readBattery()` is the single
+read seam - it returns "no sensor" when the gauge is absent or the reading is out of range, which
+is what the display and web UI render until the part is fitted.
 
 ## Wi-Fi Geolocation
 

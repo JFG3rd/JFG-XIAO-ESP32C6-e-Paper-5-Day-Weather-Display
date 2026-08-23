@@ -94,7 +94,8 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 - Bold max temperature
 - Compact legend (L = low, P = precipitation)
 - Weather icons (40×40 sprites, 4bpp palette)
-- Auto refresh every 15 minutes
+- Battery symbol in the top‑right of the header, with the charge percentage overlaid
+- Auto refresh every 30 minutes, deep sleeping in between
 
 ---
 
@@ -107,7 +108,53 @@ Open the control page at `http://<device-ip>/`:
 - Manual SSID
 - Static IP configuration
 - Language selector (EN/DE/ES/FR)
+- Battery level (meter, percentage, and voltage) in the status card
+- Deep sleep on/off toggle
 - Logs and status
+
+---
+
+## Battery and Power
+
+The display refreshes every **30 minutes** and deep sleeps in between. Each cycle is:
+
+1. Wake (timer) → connect Wi‑Fi → fetch forecast → render the panel
+2. Stay awake for **~2 minutes** so the web UI is reachable
+3. Panel to DSLP, radio off, deep sleep until the next 30‑minute mark
+
+Details:
+
+- Any HTTP request pushes the awake window forward, so an open browser tab (it polls `/status`
+  every 8 s) keeps the device awake for as long as you need it.
+- A failed forecast fetch retries after **5 minutes** instead of the full cycle.
+- AP / captive‑portal setup mode **never** sleeps.
+- The **Deep sleep between updates** toggle in the status card disables sleeping entirely
+  (persisted in NVS) when you want the device permanently reachable.
+- The sleep duration subtracts the time the wake cycle already used, so the render‑to‑render
+  period stays at 30 minutes instead of drifting by the boot time.
+- A cold boot (power‑on or reset) holds the device awake for a full **5 minutes**, so the web UI
+  is always reachable after you power it on without racing the sleep timer.
+
+---
+
+### Battery sensing — Adafruit LC709203F
+
+Battery state comes from an **Adafruit LC709203F** I²C fuel gauge on the free D4/D5 pins.
+Wiring and bring‑up: **[docs/wire-diagram.md](docs/wire-diagram.md)**.
+
+There is no alternative on this hardware: the driver board never routes `BAT_4V2` to the XIAO
+(schematic rev 1.0 — it reaches only the power switch, the ETA9740 charger and the JST BAT
+connector), and on the ESP32‑C6 the only ADC‑capable pins (D0/A0, D1/A1, D2/A2) are already used by
+the panel for RST, CS and BUSY, while D4–D7 have no ADC at all.
+
+The gauge is *on order*. Until it is fitted, the firmware logs `Battery gauge not found on I2C`
+once per wake and shows **?** on the panel / **No sensor** on the web page — no reflash is needed
+when the part arrives.
+
+Configuration lives in [include/weather_config.h](include/weather_config.h) (`kBatteryGaugeEnabled`,
+`kBatteryPackMah`, `kBatteryThermistorB`, `kBatteryLowPercent`, and the I²C pins). The gauge is left
+in operating mode across deep sleep (~15 µA) so its state‑of‑charge tracking keeps running while the
+MCU is asleep; `initRSOC()` is only re‑seeded on a cold boot.
 
 ## Language Selection
 
@@ -189,6 +236,7 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 
 - `docs/EPAPER_2IN9_BWRY_XIAO_GUIDE.md`
 - `docs/WEATHER_FORECAST_APP.md`
+- `docs/wire-diagram.md` — LC709203F fuel gauge wiring, step by step
 
 ---
 
