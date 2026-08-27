@@ -574,3 +574,28 @@ For any new project using this exact hardware:
   https://wiki.seeedstudio.com/xiao_eink_expansion_board_v2/
 - Seeed_GFX repository:
   https://github.com/Seeed-Studio/Seeed_GFX
+
+---
+
+## Local patch to the vendored driver (CHECK_BUSY timeout)
+
+`lib/Seeed_GFX/TFT_Drivers/JD79667_Defines.h` carries a **local patch that is not upstream**. The
+original macro was:
+
+```c
+#define CHECK_BUSY()  do { while (!digitalRead(TFT_BUSY)) ; } while (0)
+```
+
+An unbounded spin. If the panel stops raising BUSY — a failing FPC connector will do it — then
+`epaper.begin()` never returns, so Wi-Fi and the web server never start: blank screen *and* an
+unreachable, undebuggable board. The patched macro gives up after `epdBusyTimeoutMs` and latches
+`epdBusyTimedOut` so the application can tell whether the panel actually responded.
+
+Timeout values matter: a real BWRY full refresh takes **~19 s**, so the operating guard is 30 s.
+Anything tighter powers the panel down mid-refresh and leaves a blank or ghosted image. Init uses a
+tighter 5 s because a healthy panel answers within milliseconds of a reset.
+
+**This patch lives in a nested git repository** (`lib/Seeed_GFX` is a gitlink with no `.gitmodules`),
+so it is not tracked by this repo and will be lost if the library is re-cloned. The application-side
+protection in `setupPanel()` / `panelUpdate()` does not depend on it, but re-apply this patch if you
+refresh the library.

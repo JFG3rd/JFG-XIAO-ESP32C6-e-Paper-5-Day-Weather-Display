@@ -4,3 +4,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Vendored Seeed_GFX: examples are 43MB of bitmap headers for panels this
+# project does not use, and are not needed to build.
+lib/Seeed_GFX/examples/

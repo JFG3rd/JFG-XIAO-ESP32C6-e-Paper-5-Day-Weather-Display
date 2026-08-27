@@ -139,13 +139,18 @@ All knobs live in [include/weather_config.h](../include/weather_config.h):
 |---|---|---|
 | `kBatteryGaugeEnabled` | `true` | Set `false` to build without the gauge entirely |
 | `kBatterySdaPin` / `kBatterySclPin` | `D4` / `D5` | Move the bus if you rewire it |
-| `kBatteryPackMah` | `1000` | Pack profile. **Must** be 100/200/500/1000/2000/3000 |
+| `kBatteryPackMah` | `500` | Gauge profile. **Must** be 100/200/500/1000/2000/3000 — 500 is the nearest to the 400 mAh cell in use |
+| `kBatteryCapacityMah` | `400` | True pack capacity, used by the modelled estimate (not restricted to the profile steps) |
 | `kBatteryThermistorB` | `0` | Set to `3950` if you fit a 10 kΩ NTC on THERM |
 | `kBatteryLowPercent` | `20` | At or below this, the glyph and web meter turn red |
 
-`kBatteryPackMah` must match your actual cell — the LC709203F uses it to pick its internal
-discharge profile, and a wrong value skews the percentage. The cell that ships with the driver
-board is 1000 mAh (see the schematic's `BAT: 4.2V 1000mAH` note).
+`kBatteryPackMah` picks the gauge's internal discharge profile, so set it to the nearest supported
+step for your cell — 500 for the 400 mAh pack in use. `kBatteryCapacityMah` is separate and takes
+the true capacity; it drives the modelled estimate used while no gauge is fitted.
+
+Until the gauge arrives the display shows a modelled percentage with a trailing `?` (see the
+README's "Battery level" section). Fitting the gauge replaces it with a real reading and the `?`
+disappears — no code change needed.
 
 ---
 

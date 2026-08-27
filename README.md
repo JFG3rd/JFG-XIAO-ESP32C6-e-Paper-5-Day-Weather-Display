@@ -116,16 +116,35 @@ Open the control page at `http://<device-ip>/`:
 
 ## Battery and Power
 
-The display refreshes every **30 minutes** and deep sleeps in between. Each cycle is:
+The display refreshes on a **configurable interval (default 60 minutes)** and deep sleeps in
+between. Each cycle is:
 
-1. Wake (timer) → connect Wi‑Fi → fetch forecast → render the panel
-2. Stay awake for **~2 minutes** so the web UI is reachable
-3. Panel to DSLP, radio off, deep sleep until the next 30‑minute mark
+1. Wake (timer) → connect Wi‑Fi → fetch forecast → render the panel (~26 s total; the BWRY panel
+   refresh alone takes ~19 s)
+2. Stay awake for **30 seconds** so the web UI is reachable
+3. Panel to DSLP, radio off, deep sleep until the next interval mark
+
+### Expected runtime
+
+On the 400 mAh pack, assuming ~90 mA awake and ~0.2 mA asleep:
+
+| Awake window | Interval | Per day | Runtime |
+|---|---|---|---|
+| 120 s | 30 min | ~184 mAh | ~2 days |
+| 30 s | 30 min | ~72 mAh | ~5.5 days |
+| **30 s** | **60 min (default)** | **~35 mAh** | **~11 days** |
+
+The least certain figure is the deep‑sleep current — it is dominated by the driver board's boost
+converter, not the MCU. If runtime falls well short of the table, measure it with a multimeter in
+series with the pack and correct `kEstimatedSleepUa` in
+[include/weather_config.h](include/weather_config.h).
 
 Details:
 
+- The interval is set from the web UI (15/30/60/120/240 min) and persisted in NVS.
 - Any HTTP request pushes the awake window forward, so an open browser tab (it polls `/status`
-  every 8 s) keeps the device awake for as long as you need it.
+  every 8 s) keeps the device awake for as long as you need it — bounded by a **10‑minute hard cap**
+  per wake cycle, so a forgotten tab or a router probing port 80 can never drain the pack.
 - A failed forecast fetch retries after **5 minutes** instead of the full cycle.
 - AP / captive‑portal setup mode **never** sleeps.
 - The **Deep sleep between updates** toggle in the status card disables sleeping entirely
@@ -137,10 +156,32 @@ Details:
 
 ---
 
-### Battery sensing — Adafruit LC709203F
+### Battery level: measured, or estimated with a "?"
 
-Battery state comes from an **Adafruit LC709203F** I²C fuel gauge on the free D4/D5 pins.
-Wiring and bring‑up: **[docs/wire-diagram.md](docs/wire-diagram.md)**.
+With no fuel gauge fitted, the firmware still knows exactly how long it spent awake and asleep, so
+it integrates that against assumed currents to model the remaining charge. Modelled values are
+always shown **with a trailing `?`** — `79?` on the panel, `79% ~estimated` on the web page — so an
+estimate is never mistaken for a measurement.
+
+Because the model cannot detect charging, it needs an explicit zero point: press
+**"Battery charged"** in the web UI after every charge to reset it to 100 %. The relevant constants
+(`kBatteryCapacityMah`, `kEstimatedActiveMa`, `kEstimatedSleepUa`) live in
+[include/weather_config.h](include/weather_config.h).
+
+Fit an **Adafruit LC709203F** on the free D4/D5 pins and it takes over automatically, with real
+voltage and state‑of‑charge and no `?`. Wiring and bring‑up:
+**[docs/wire-diagram.md](docs/wire-diagram.md)**.
+
+### Panel resilience
+
+The vendored driver's `CHECK_BUSY()` originally spun forever waiting on the panel's BUSY line, so a
+panel that stopped answering hung `epaper.begin()` before Wi‑Fi started — a blank screen *and* an
+unreachable device. That wait is now bounded (30 s in operation, 5 s during init; a real BWRY
+refresh takes ~19 s, so the guard must stay well clear of it). If the panel will not answer, the
+firmware logs why, sets `panelReady: false` in `/status`, skips rendering and carries on booting, so
+the web UI is still there to diagnose with. `GET /panelProbe` re‑tests the panel on demand and
+reports the BUSY line's electrical state — `busyFloating=0, busyPullup=1` means nothing is driving
+the line at all, which points at the FPC connector rather than firmware.
 
 There is no alternative on this hardware: the driver board never routes `BAT_4V2` to the XIAO
 (schematic rev 1.0 — it reaches only the power switch, the ETA9740 charger and the JST BAT

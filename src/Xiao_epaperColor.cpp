@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -22,6 +23,19 @@
 #ifdef EPAPER_ENABLE
 EPaper epaper;
 #endif
+
+// Latched by the patched CHECK_BUSY() in JD79667_Defines.h when the panel fails
+// to raise BUSY within EPD_BUSY_TIMEOUT_MS. Must live at global scope with C++
+// linkage matching the extern declaration in that header.
+volatile bool epdBusyTimedOut = false;
+// How long the driver waits on BUSY before giving up. This is a hang guard, not
+// a deadline: a real BWRY full refresh takes 12-16 s, so the operating value must
+// be comfortably above that or the driver powers the panel down mid-refresh and
+// leaves a blank or ghosted image. Init uses a much tighter value (see setupPanel)
+// because a healthy panel answers within milliseconds of a reset.
+constexpr uint32_t kBusyTimeoutRefreshMs = 30000;
+constexpr uint32_t kBusyTimeoutInitMs = 5000;
+volatile uint32_t epdBusyTimeoutMs = kBusyTimeoutRefreshMs;
 
 namespace
 {
@@ -41,13 +55,17 @@ constexpr uint32_t kReconnectCheckIntervalMs = 10000;
 constexpr uint32_t kScanCacheTtlMs = 30000;
 constexpr uint32_t kHttpTimeoutMs = 15000;
 constexpr uint32_t kNtpTimeoutMs = 10000;
-// Refresh forecast every 30 minutes. Each cycle ends in deep sleep, so this is
-// also the wall-clock wake period (boot + fetch time is subtracted before sleeping).
-constexpr uint32_t kRefreshIntervalMs = 30UL * 60UL * 1000UL;
+// Refresh interval is user-configurable (web UI, persisted in NVS). Each cycle
+// ends in deep sleep, so this is also the wall-clock wake period - boot and fetch
+// time are subtracted before sleeping to keep the cadence honest.
+constexpr uint16_t kDefaultRefreshMinutes = 60;
+constexpr uint16_t kRefreshMinutesOptions[] = {15, 30, 60, 120, 240};
 // After every render the device stays awake this long so the web UI is reachable.
 // Any handled HTTP request pushes the deadline forward, so an open browser tab
-// keeps the device awake indefinitely.
-constexpr uint32_t kAwakeWindowMs = 2UL * 60UL * 1000UL;
+// keeps the device awake (up to kMaxAwakeMs). This window is the single biggest
+// lever on battery life: at ~90 mA awake, every extra minute per cycle costs
+// ~1.5 mAh, which is a meaningful slice of a 400 mAh pack.
+constexpr uint32_t kAwakeWindowMs = 30UL * 1000UL;
 // A cold boot (power-on or reset) holds the device awake for longer: that is
 // when someone is most likely to be reaching for the web UI, and a 5 minute
 // floor means they never have to race the sleep timer.
@@ -55,6 +73,15 @@ constexpr uint32_t kColdBootAwakeMs = 5UL * 60UL * 1000UL;
 // Shorter cycle when the forecast could not be fetched, so a transient outage
 // does not leave stale data on screen for a full half hour.
 constexpr uint32_t kRetrySleepMs = 5UL * 60UL * 1000UL;
+// Absolute ceiling on how long one wake cycle may stay awake, regardless of web
+// traffic. Without it, any HTTP request postpones sleep by another two minutes
+// forever - a forgotten browser tab, or a router probing port 80 to build its
+// device list, quietly keeps the radio up and drains the pack. Must stay above
+// kColdBootAwakeMs or a cold boot would sleep before its hold expires.
+constexpr uint32_t kMaxAwakeMs = 10UL * 60UL * 1000UL;
+// A request arriving after this much silence is logged with its client IP, to
+// identify whatever is re-arming the awake window.
+constexpr uint32_t kWebQuietLogThresholdMs = 60UL * 1000UL;
 constexpr uint8_t kWifiConnectAttempts = 2;
 constexpr uint8_t kMaxReconnectFailuresBeforeAp = 3;
 constexpr byte kDnsPort = 53;
@@ -78,9 +105,15 @@ uint32_t lastRefreshMs = 0;
 uint32_t lastReconnectAttemptMs = 0;
 // Deadline (millis) until which the device stays awake. Extended by web activity.
 uint32_t awakeUntilMs = 0;
+// Handled web requests this wake cycle. Exposed in /status so it is possible to
+// tell "a browser tab is holding the device awake" apart from "sleep is broken".
+uint32_t webRequestCount = 0;
+uint32_t lastWebRequestMs = 0;
 // Deep sleep can be disabled from the web UI to keep the device permanently
 // reachable for debugging. Persisted in NVS so it survives the sleep/reboot cycle.
 bool deepSleepEnabled = true;
+// Minutes between forecast refreshes, set from the web UI and persisted in NVS.
+uint16_t refreshIntervalMinutes = kDefaultRefreshMinutes;
 uint8_t reconnectFailures = 0;
 uint8_t lastDisconnectReason = 0;
 uint32_t lastScanCacheMs = 0;
@@ -154,8 +187,11 @@ StaticIpConfig staticIpConfig = {};
 
 struct BatteryStatus
 {
-  // false when no sense hardware is present, i.e. nothing was measured.
+  // false when neither a measurement nor an estimate is available.
   bool valid = false;
+  // true when the percentage is modeled from run time rather than measured by a
+  // fuel gauge. Such values are rendered with a trailing "?".
+  bool estimated = false;
   float volts = 0.0f;
   uint8_t percent = 0;
 };
@@ -165,6 +201,9 @@ BatteryStatus currentBattery = {};
 // I2C LiPo fuel gauge on D4/D5. See docs/wire-diagram.md.
 Adafruit_LC709203F batteryGauge;
 bool batteryGaugeReady = false;
+// False when the panel failed to answer during init; rendering is then skipped
+// so the rest of the firmware (Wi-Fi, web UI) still comes up.
+bool panelReady = false;
 
 enum class WeatherVisual
 {
@@ -246,6 +285,10 @@ struct UiText
   const char* staticIpDns1;
   const char* staticIpDns2;
   const char* statusBattery;
+  const char* statusSleepIn;
+  const char* refreshIntervalLabel;
+  const char* batteryChargedButton;
+  const char* batteryEstimatedNote;
   const char* batteryUnknown;
   const char* sleepModeLabel;
   const char* sleepModeHint;
@@ -304,6 +347,10 @@ const UiText kUiText[] = {
         "DNS 1",
         "DNS 2",
         "Battery",
+        "Sleeps in",
+        "Refresh every",
+        "Battery charged",
+        "estimated",
         "No sensor",
         "Deep sleep between updates",
         "Off keeps this page always reachable.",
@@ -361,6 +408,10 @@ const UiText kUiText[] = {
         "DNS 1",
         "DNS 2",
         "Batterie",
+        "Schlaeft in",
+        "Aktualisieren alle",
+        "Batterie geladen",
+        "geschaetzt",
         "Kein Sensor",
         "Tiefschlaf zwischen Updates",
         "Aus haelt diese Seite dauerhaft erreichbar.",
@@ -418,6 +469,10 @@ const UiText kUiText[] = {
         "DNS 1",
         "DNS 2",
         "Bateria",
+        "Duerme en",
+        "Actualizar cada",
+        "Bateria cargada",
+        "estimado",
         "Sin sensor",
         "Suspension entre actualizaciones",
         "Desactivado mantiene esta pagina siempre accesible.",
@@ -475,6 +530,10 @@ const UiText kUiText[] = {
         "DNS 1",
         "DNS 2",
         "Batterie",
+        "Veille dans",
+        "Actualiser toutes les",
+        "Batterie chargee",
+        "estime",
         "Pas de capteur",
         "Veille profonde entre les mises a jour",
         "Desactive garde cette page toujours accessible.",
@@ -1103,8 +1162,31 @@ String clampTextToWidth(const String& text, uint16_t maxWidth, uint8_t font)
   return clipped.isEmpty() ? "" : clipped + "...";
 }
 
+// Push the framebuffer to the panel and report whether the panel actually
+// completed the refresh. Distinguishes "the image was drawn" from "the driver
+// gave up waiting on BUSY", which look identical from the outside: both return,
+// and a panel that cannot drive its high-voltage rails stays blank either way.
+void panelUpdate(const char* what)
+{
+  if (!panelReady) {
+    return;
+  }
+  const uint32_t start = millis();
+  epdBusyTimedOut = false;
+  epaper.update();
+  const uint32_t elapsed = millis() - start;
+  if (epdBusyTimedOut) {
+    addLog(String("Panel BUSY timed out during ") + what + " after " + elapsed + " ms; image NOT updated.");
+  } else {
+    addLog(String("Panel refresh (") + what + ") completed in " + elapsed + " ms.");
+  }
+}
+
 void renderSetupScreen(const String& title, const String& line1, const String& line2)
 {
+  if (!panelReady) {
+    return;
+  }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
   epaper.fillScreen(TFT_WHITE);
@@ -1114,7 +1196,120 @@ void renderSetupScreen(const String& title, const String& line1, const String& l
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
   epaper.drawString(line1, 8, 42, 2);
   epaper.drawString(line2, 8, 66, 1);
-  epaper.update();
+  panelUpdate("setup screen");
+}
+
+#ifdef EPAPER_ENABLE
+// Reset the panel and wait for it to report ready, with a bound on the wait.
+//
+// This deliberately duplicates what the driver's init does, because the driver's
+// CHECK_BUSY() spins forever: calling epaper.begin() on an unresponsive panel
+// hangs setup() before Wi-Fi starts, leaving the device blank AND unreachable.
+// Probing first means we only enter the driver when the panel is actually
+// answering. Returns false if BUSY never goes high.
+// Probe the BUSY line's electrical behaviour. A panel that is connected but busy
+// actively drives the line low, so it reads low with the internal pull-up on. A
+// line with no connection at all (unseated FPC, broken trace) floats, so it reads
+// low bare but high with the pull-up. This distinguishes a stuck panel from a
+// panel that is not electrically there.
+void logBusyLineState()
+{
+  pinMode(TFT_BUSY, INPUT);
+  delay(5);
+  const int floating = digitalRead(TFT_BUSY);
+  pinMode(TFT_BUSY, INPUT_PULLUP);
+  delay(5);
+  const int pulledUp = digitalRead(TFT_BUSY);
+  pinMode(TFT_BUSY, INPUT);
+  addLog(String("BUSY line: floating=") + floating + " pullup=" + pulledUp +
+         (pulledUp && !floating ? " (line not driven - check FPC seating)"
+                                : (!pulledUp ? " (panel actively holding BUSY low)" : "")));
+}
+
+bool resetPanelAndWaitReady(uint32_t resetLowMs, uint32_t timeoutMs)
+{
+  pinMode(TFT_BUSY, INPUT);
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, LOW);
+  delay(resetLowMs);
+  digitalWrite(TFT_RST, HIGH);
+  delay(50);
+
+  const uint32_t start = millis();
+  while (!digitalRead(TFT_BUSY)) {
+    if ((millis() - start) > timeoutMs) {
+      return false;
+    }
+    delay(1);
+  }
+  return true;
+}
+#endif
+
+// Bring up the e-paper panel, tolerating a panel that will not respond.
+//
+// The panel is left in DSLP by EPaper::update() and the MCU then deep-sleeps, so
+// on every wake it needs a hardware reset to answer at all. If it will not answer,
+// booting continues headless: a dead panel must not cost us Wi-Fi and the web UI,
+// which are the only means left to diagnose it.
+void setupPanel(bool coldBoot)
+{
+#ifdef EPAPER_ENABLE
+  (void)coldBoot;
+  panelReady = false;
+
+  // Release the sleep-time hold before touching RST, otherwise the reset pulse
+  // cannot drive the line. Drive the pin to the level it was held at first:
+  // releasing a hold on a pin whose output register disagrees glitches the line
+  // (see the gpio_hold_dis documentation).
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, LOW);
+  gpio_hold_dis(static_cast<gpio_num_t>(TFT_RST));
+  delay(20);
+
+  // Park the bus in its idle state before touching the panel. Resetting it with
+  // a floating chip select is unreliable - the panel can come out of reset with
+  // the bus mid-transaction and never raise BUSY. The driver's own init does
+  // this first too, which is why calling begin() directly works where a bare
+  // reset-then-probe does not.
+  // A healthy panel raises BUSY within milliseconds of a reset, so keep the init
+  // guard tight - it bounds how long a dead panel delays the boot.
+  epdBusyTimeoutMs = kBusyTimeoutInitMs;
+
+  pinMode(TFT_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
+  pinMode(TFT_DC, OUTPUT);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_RST, HIGH);
+  delay(10);
+
+  // begin() performs its own reset and full register init; the bounded
+  // CHECK_BUSY() means it can no longer hang forever. Retry once behind a longer
+  // reset pulse, which a panel climbing out of DSLP sometimes needs.
+  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+    if (attempt == 1) {
+      digitalWrite(TFT_RST, LOW);
+      delay(200);
+      digitalWrite(TFT_RST, HIGH);
+      delay(200);
+    }
+    epdBusyTimedOut = false;
+    epaper.begin();
+    if (!epdBusyTimedOut) {
+      panelReady = true;
+      epdBusyTimeoutMs = kBusyTimeoutRefreshMs;
+      addLog(String("Panel ready (init attempt ") + (attempt + 1) + ").");
+      return;
+    }
+    addLog(String("Panel BUSY timed out during init attempt ") + (attempt + 1) + ".");
+  }
+
+  epdBusyTimeoutMs = kBusyTimeoutRefreshMs;
+  logBusyLineState();
+  addLog("Panel not responding; continuing headless so the web UI stays reachable.");
+#else
+  (void)coldBoot;
+#endif
 }
 
 // Translate the configured pack capacity into the gauge's APA profile constant.
@@ -1179,12 +1374,72 @@ void setupBatteryGauge(bool coldBoot)
   addLog(String("Battery gauge ready (IC version 0x") + String(batteryGauge.getICversion(), HEX) + ").");
 }
 
-// Single seam for battery state. Returns valid = false when the gauge is absent
-// or unreadable, which the display and web UI render as "no sensor".
+// Consumed charge since the pack was last marked full, in microamp-hours.
+// Persisted in NVS because deep sleep wipes RAM every cycle.
+uint32_t consumedUah = 0;
+
+void loadConsumedCharge()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading battery estimate.");
+    return;
+  }
+  consumedUah = preferences.getUInt("uah_used", 0);
+  preferences.end();
+}
+
+// Add one cycle's charge to the running total and persist it. Called from
+// enterDeepSleep(), the one place that knows both how long this wake stayed
+// awake and how long the coming sleep will be.
+void accumulateConsumedCharge(uint32_t awakeMs, uint32_t sleepMs)
+{
+  // mA * ms -> uAh:  mA * 1000 = uA;  ms / 3600000 = h.
+  const uint64_t activeUah =
+      (static_cast<uint64_t>(weather_config::kEstimatedActiveMa) * 1000ULL * awakeMs) / 3600000ULL;
+  const uint64_t sleepUah =
+      (static_cast<uint64_t>(weather_config::kEstimatedSleepUa) * sleepMs) / 3600000ULL;
+  consumedUah += static_cast<uint32_t>(activeUah + sleepUah);
+
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    return;
+  }
+  preferences.putUInt("uah_used", consumedUah);
+  preferences.end();
+}
+
+// Reset the estimate to "full". The modeled value has no way to detect charging,
+// so it needs this explicit zero point - the web UI exposes it as a button.
+void resetConsumedCharge()
+{
+  consumedUah = 0;
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    return;
+  }
+  preferences.putUInt("uah_used", 0);
+  preferences.end();
+}
+
+// Modeled state of charge from accumulated run time. Only meaningful relative to
+// the last "battery charged" reset.
+uint8_t estimatedBatteryPercent()
+{
+  const uint32_t capacityUah = static_cast<uint32_t>(weather_config::kBatteryCapacityMah) * 1000UL;
+  if (consumedUah >= capacityUah) {
+    return 0;
+  }
+  return static_cast<uint8_t>(((capacityUah - consumedUah) * 100ULL) / capacityUah);
+}
+
+// Single seam for battery state. Prefers the fuel gauge; falls back to the
+// modeled estimate so the UI can still show something useful (flagged as a
+// guess) when no gauge is fitted.
 BatteryStatus readBattery()
 {
   BatteryStatus status = {};
   if (!batteryGaugeReady) {
+    status.valid = true;
+    status.estimated = true;
+    status.percent = estimatedBatteryPercent();
     return status;
   }
 
@@ -1234,7 +1489,12 @@ void drawBatteryIcon(int32_t x, int32_t y, const BatteryStatus& battery)
   // digits sit on top of the fill bar instead of erasing it.
   epaper.setTextColor(TFT_BLACK);
   epaper.setTextDatum(TL_DATUM);
-  const String label = battery.valid ? String(battery.percent) : String("?");
+  // A modeled value gets a trailing "?" so an estimate is never mistaken for a
+  // measurement; with neither, just the "?".
+  String label = String("?");
+  if (battery.valid) {
+    label = String(battery.percent) + (battery.estimated ? "?" : "");
+  }
   epaper.drawCentreString(label, x + kBodyWidth / 2, y + 3, 1);
   // Restore an opaque text color for the callers that follow.
   epaper.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -1318,6 +1578,9 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
 // Full-screen forecast render. This redraws the full frame (not partial refresh).
 void renderForecast(const ForecastData& forecast)
 {
+  if (!panelReady) {
+    return;
+  }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
   const uint16_t displayWidth = epaper.width();
@@ -1335,11 +1598,14 @@ void renderForecast(const ForecastData& forecast)
     renderDayCard(forecast.days[i], cardX, usableTop, cardWidth, cardHeight);
     renderFooterMetrics(forecast.days[i], cardX, usableTop + cardHeight - 12, cardWidth);
   }
-  epaper.update();
+  panelUpdate("forecast");
 }
 
 void renderErrorScreen(const String& title, const String& detail)
 {
+  if (!panelReady) {
+    return;
+  }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
   epaper.fillScreen(TFT_WHITE);
@@ -1349,7 +1615,7 @@ void renderErrorScreen(const String& title, const String& detail)
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
   epaper.drawString(title, 8, 38, 2);
   epaper.drawString(detail, 8, 62, 1);
-  epaper.update();
+  panelUpdate("error screen");
 }
 
 void loadStoredCredentials()
@@ -1419,6 +1685,49 @@ void loadSleepPreference()
   preferences.end();
 }
 
+uint32_t refreshIntervalMs()
+{
+  return static_cast<uint32_t>(refreshIntervalMinutes) * 60UL * 1000UL;
+}
+
+bool isRefreshIntervalSupported(uint16_t minutes)
+{
+  for (uint8_t i = 0; i < (sizeof(kRefreshMinutesOptions) / sizeof(kRefreshMinutesOptions[0])); ++i) {
+    if (kRefreshMinutesOptions[i] == minutes) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Load the refresh interval from NVS. Longer intervals are the main way to trade
+// forecast freshness for battery life, so this is a user setting rather than a
+// compile-time constant.
+void loadRefreshPreference()
+{
+  refreshIntervalMinutes = kDefaultRefreshMinutes;
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading refresh interval. Using default.");
+    return;
+  }
+  const uint16_t stored = preferences.getUShort("refresh_min", kDefaultRefreshMinutes);
+  preferences.end();
+  if (isRefreshIntervalSupported(stored)) {
+    refreshIntervalMinutes = stored;
+  }
+}
+
+void saveRefreshPreference(uint16_t minutes)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving refresh interval.");
+    return;
+  }
+  preferences.putUShort("refresh_min", minutes);
+  preferences.end();
+  refreshIntervalMinutes = minutes;
+}
+
 void saveSleepPreference(bool enabled)
 {
   if (!preferences.begin(kPrefsNamespace, false)) {
@@ -1432,20 +1741,56 @@ void saveSleepPreference(bool enabled)
 
 // Hold the device awake for at least windowMs from now. The deadline only ever
 // moves forward, so a short window can never cut a longer one short (e.g. the
-// 5 minute cold-boot hold surviving the render's 2 minute window).
+// 5 minute cold-boot hold surviving the render's 2 minute window). It is also
+// clamped to kMaxAwakeMs: deep sleep resets the MCU, so millis() is the time
+// since this wake began and the cap can be compared against it directly.
 void extendAwakeWindow(uint32_t windowMs)
 {
-  const uint32_t candidate = millis() + windowMs;
+  uint32_t candidate = millis() + windowMs;
+  if (candidate > kMaxAwakeMs) {
+    candidate = kMaxAwakeMs;
+  }
   if (static_cast<int32_t>(candidate - awakeUntilMs) > 0) {
     awakeUntilMs = candidate;
   }
 }
 
-// Push back the deep sleep deadline. Called from every web handler so an open
-// browser tab (which polls /status every 8s) keeps the device awake.
+// Push back the deep sleep deadline. Call this from web handlers only - it
+// counts and logs the request. Non-HTTP callers that just want to hold the
+// device awake should call extendAwakeWindow() directly.
 void noteWebActivity()
 {
+  // Log the first request after a quiet spell, with the client and path. That is
+  // exactly the event that re-arms the awake window, so if something on the LAN
+  // (a router probing port 80, a scanner) is holding the device awake, these few
+  // entries name it without flooding the 24-entry log ring.
+  const uint32_t now = millis();
+  if (webRequestCount == 0 || (now - lastWebRequestMs) > kWebQuietLogThresholdMs) {
+    addLog(String("Web request from ") + server.client().remoteIP().toString() + " " + server.uri() +
+           " after " + ((now - lastWebRequestMs) / 1000) + " s quiet.");
+  }
+  lastWebRequestMs = now;
+  ++webRequestCount;
   extendAwakeWindow(kAwakeWindowMs);
+}
+
+// <option> list for the refresh-interval selector, marking the active value.
+String buildRefreshOptions()
+{
+  String options;
+  for (uint8_t i = 0; i < (sizeof(kRefreshMinutesOptions) / sizeof(kRefreshMinutesOptions[0])); ++i) {
+    const uint16_t minutes = kRefreshMinutesOptions[i];
+    options += "<option value='";
+    options += String(minutes);
+    options += "'";
+    if (minutes == refreshIntervalMinutes) {
+      options += " selected";
+    }
+    options += ">";
+    options += String(minutes);
+    options += " min</option>";
+  }
+  return options;
 }
 
 String buildLanguageOptions()
@@ -1953,10 +2298,27 @@ String buildStatusJson()
   json += currentBattery.valid ? "true" : "false";
   json += ",\"batteryPercent\":";
   json += String(currentBattery.percent);
+  json += ",\"batteryEstimated\":";
+  json += currentBattery.estimated ? "true" : "false";
+  json += ",\"panelReady\":";
+  json += panelReady ? "true" : "false";
+  json += ",\"refreshMinutes\":";
+  json += String(refreshIntervalMinutes);
   json += ",\"batteryVolts\":\"";
   json += currentBattery.valid ? batteryVoltsText(currentBattery) : String("");
   json += "\",\"deepSleepEnabled\":";
   json += deepSleepEnabled ? "true" : "false";
+  // Diagnostics for the sleep cycle: how long until the device may sleep, how
+  // many requests have pushed that deadline back, and how long it has been up.
+  json += ",\"awakeSecondsLeft\":";
+  {
+    const int32_t remainingMs = static_cast<int32_t>(awakeUntilMs - millis());
+    json += String(remainingMs > 0 ? (remainingMs / 1000) : 0);
+  }
+  json += ",\"webRequests\":";
+  json += String(webRequestCount);
+  json += ",\"uptimeSeconds\":";
+  json += String(millis() / 1000);
   // Include live network config so the main page JS can pre-fill the static IP
   // fields with the current DHCP-assigned values (gateway, subnet, DNS).
   const bool isConnected = (WiFi.status() == WL_CONNECTED);
@@ -2214,6 +2576,11 @@ String buildMainPage()
         </label>
       </div>
       <div class="sleep-hint">{{SLEEP_MODE_HINT}}</div>
+      <label for="refreshMinutes">{{REFRESH_INTERVAL_LABEL}}</label>
+      <select id="refreshMinutes">{{REFRESH_OPTIONS}}</select>
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-nav" onclick="markBatteryFull()">{{BATTERY_CHARGED_BUTTON}}</button>
+      </div>
     </div>
     <div class="card">
       <h2 class="card-title">{{WIFI_SETUP_TITLE}}</h2>
@@ -2271,7 +2638,9 @@ String buildMainPage()
       forecastValid: '{{FORECAST_VALID}}',
       forecastMissing: '{{FORECAST_MISSING}}',
       statusBattery: '{{STATUS_BATTERY}}',
-      batteryUnknown: '{{BATTERY_UNKNOWN}}'
+      statusSleepIn: '{{STATUS_SLEEP_IN}}',
+      batteryUnknown: '{{BATTERY_UNKNOWN}}',
+      batteryEstimatedNote: '{{BATTERY_ESTIMATED_NOTE}}'
     };
     let currentConnectedSsid = '';
     // Dark mode
@@ -2302,7 +2671,8 @@ String buildMainPage()
       const percent = Math.max(0, Math.min(100, status.batteryPercent || 0));
       const low = percent <= {{BATTERY_LOW_PERCENT}} ? ' low' : '';
       const volts = status.batteryVolts ? ` (${status.batteryVolts} V)` : '';
-      return `<span class="battery"><span class="battery-body"><span class="battery-fill${low}" style="width:${percent}%"></span></span>${percent}%${volts}</span>`;
+      const note = status.batteryEstimated ? ` ~${ui.batteryEstimatedNote}` : '';
+      return `<span class="battery"><span class="battery-body"><span class="battery-fill${low}" style="width:${percent}%"></span></span>${percent}%${volts}${note}</span>`;
     }
     async function scanNetworks() {
       const select = document.getElementById('ssid');
@@ -2339,7 +2709,8 @@ String buildMainPage()
         makeInfoItem(ui.statusReason, status.disconnectReason || '-') +
         makeInfoItem(ui.statusForecast, status.forecastValid ? ui.forecastValid : ui.forecastMissing) +
         makeInfoItem(ui.statusUpdated, status.updated || '-') +
-        makeInfoItem(ui.statusBattery, makeBatteryValue(status));
+        makeInfoItem(ui.statusBattery, makeBatteryValue(status)) +
+        makeInfoItem(ui.statusSleepIn, status.deepSleepEnabled ? `${status.awakeSecondsLeft}s` : '-');
       const sleepToggle = document.getElementById('sleepToggle');
       // Do not fight the user mid-click: only sync the toggle when it is idle.
       if (sleepToggle && document.activeElement !== sleepToggle) {
@@ -2416,6 +2787,22 @@ String buildMainPage()
       await updateStatus();
       await updateLogs();
     }
+    async function setRefreshInterval() {
+      const minutes = parseInt(document.getElementById('refreshMinutes').value, 10);
+      await fetch('/refreshInterval', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({minutes})
+      });
+      await updateStatus();
+      await updateLogs();
+    }
+    async function markBatteryFull() {
+      const response = await fetch('/batteryFull', {method: 'POST'});
+      alert(await response.text());
+      await updateStatus();
+    }
+    document.getElementById('refreshMinutes').addEventListener('change', setRefreshInterval);
     document.getElementById('sleepToggle').addEventListener('change', setSleepMode);
     document.getElementById('language').addEventListener('change', setLanguage);
     document.getElementById('manual_ssid').addEventListener('input', e => {
@@ -2435,6 +2822,11 @@ String buildMainPage()
   page.replace("{{LOADING_STATE}}", t.loadingState);
   page.replace("{{STATUS_TITLE}}", t.statusTitle);
   page.replace("{{STATUS_BATTERY}}", t.statusBattery);
+  page.replace("{{STATUS_SLEEP_IN}}", t.statusSleepIn);
+  page.replace("{{REFRESH_INTERVAL_LABEL}}", t.refreshIntervalLabel);
+  page.replace("{{BATTERY_CHARGED_BUTTON}}", t.batteryChargedButton);
+  page.replace("{{BATTERY_ESTIMATED_NOTE}}", t.batteryEstimatedNote);
+  page.replace("{{REFRESH_OPTIONS}}", buildRefreshOptions());
   page.replace("{{BATTERY_UNKNOWN}}", t.batteryUnknown);
   page.replace("{{BATTERY_LOW_PERCENT}}", String(weather_config::kBatteryLowPercent));
   page.replace("{{SLEEP_MODE_LABEL}}", t.sleepModeLabel);
@@ -2813,7 +3205,7 @@ bool refreshForecastAndDisplay()
   // Sample the battery before drawing so the header glyph matches this frame,
   // and grant a fresh awake window so the web UI is reachable after an update.
   currentBattery = readBattery();
-  noteWebActivity();
+  extendAwakeWindow(kAwakeWindowMs);
 
   if (WiFi.status() != WL_CONNECTED) {
     forecastValid = false;
@@ -2860,6 +3252,64 @@ void handleSleepMode()
   saveSleepPreference(doc["enabled"].as<bool>());
   addLog(String("Deep sleep ") + (deepSleepEnabled ? "enabled." : "disabled."));
   server.send(200, "text/plain", deepSleepEnabled ? "Deep sleep enabled." : "Deep sleep disabled.");
+}
+
+void handleRefreshInterval()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const uint16_t minutes = doc["minutes"] | 0;
+  if (!isRefreshIntervalSupported(minutes)) {
+    server.send(400, "text/plain", "Unsupported interval");
+    return;
+  }
+
+  saveRefreshPreference(minutes);
+  addLog(String("Refresh interval set to ") + minutes + " min.");
+  server.send(200, "text/plain", String("Refresh interval set to ") + minutes + " min.");
+}
+
+// Fast, on-demand panel probe. Re-runs a reset and reports the BUSY line state
+// without the full driver init, so it answers in ~1.5 s instead of ~27 s. Lets
+// the connector be re-seated while watching a live readout.
+void handlePanelProbe()
+{
+  noteWebActivity();
+#ifdef EPAPER_ENABLE
+  pinMode(TFT_BUSY, INPUT);
+  delay(5);
+  const int floating = digitalRead(TFT_BUSY);
+  pinMode(TFT_BUSY, INPUT_PULLUP);
+  delay(5);
+  const int pulledUp = digitalRead(TFT_BUSY);
+  pinMode(TFT_BUSY, INPUT);
+  const bool ready = resetPanelAndWaitReady(20, 1500);
+  String json = "{\"busyFloating\":";
+  json += String(floating);
+  json += ",\"busyPullup\":";
+  json += String(pulledUp);
+  json += ",\"panelAnswers\":";
+  json += ready ? "true" : "false";
+  json += ",\"panelReady\":";
+  json += panelReady ? "true" : "false";
+  json += "}";
+  server.send(200, "application/json", json);
+#else
+  server.send(200, "application/json", "{\"panelAnswers\":false}");
+#endif
+}
+
+void handleBatteryFull()
+{
+  noteWebActivity();
+  resetConsumedCharge();
+  currentBattery = readBattery();
+  addLog("Battery marked as fully charged; estimate reset to 100%.");
+  server.send(200, "text/plain", "Battery estimate reset to 100%.");
 }
 
 void handleReboot()
@@ -2952,6 +3402,9 @@ void setupWebServer()
   server.on("/forgetWiFi", HTTP_POST, handleForgetWiFi);
   server.on("/refresh", HTTP_POST, handleRefresh);
   server.on("/sleepMode", HTTP_POST, handleSleepMode);
+  server.on("/refreshInterval", HTTP_POST, handleRefreshInterval);
+  server.on("/batteryFull", HTTP_POST, handleBatteryFull);
+  server.on("/panelProbe", HTTP_GET, handlePanelProbe);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.onNotFound(handleNotFound);
   routesConfigured = true;
@@ -2962,13 +3415,26 @@ void setupWebServer()
 // the e-paper keeps showing the last frame throughout.
 void enterDeepSleep(uint32_t sleepMs)
 {
+  accumulateConsumedCharge(millis(), sleepMs);
   addLog(String("Entering deep sleep for ") + (sleepMs / 1000) + " s.");
   Serial.flush();
 
 #ifdef EPAPER_ENABLE
   // EPaper::update() already ends in DSLP, but a cycle that never rendered (or
   // one that only errored) may leave the panel awake. sleep() is idempotent.
-  epaper.sleep();
+  if (panelReady) {
+    epaper.sleep();
+  }
+  // Park the panel in reset and hold that level through deep sleep. Left to
+  // float, the control pins put the panel in an undefined state that its next
+  // init could not always recover from - which is what hung the boot. The image
+  // survives regardless: e-paper is bistable and needs no power to hold a frame.
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, LOW);
+  // On the C6 (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP) gpio_hold_en() alone
+  // holds the pad through deep sleep; the global gpio_deep_sleep_hold_en() is
+  // compiled out for this target.
+  gpio_hold_en(static_cast<gpio_num_t>(TFT_RST));
 #endif
 
   if (serverStarted) {
@@ -2988,9 +3454,11 @@ void setupRuntime()
   loadStoredCredentials();
   loadLanguagePreference();
   loadSleepPreference();
+  loadRefreshPreference();
+  loadConsumedCharge();
   loadStaticIpConfig();
   setupWebServer();
-  noteWebActivity();
+  extendAwakeWindow(kAwakeWindowMs);
 
   // If no credentials were previously saved, prefer fast AP onboarding for Apple CNA.
   if (!hasStoredCredentials && usingCompiledDefaults) {
@@ -3025,14 +3493,12 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
+  const bool coldBoot = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER);
+
 #ifdef EPAPER_ENABLE
-  // Always take the full init path: it hardware-resets the panel and issues
-  // EPD_WAKEUP, which is required because the panel is left in DSLP across deep
-  // sleep while the freshly constructed EPaper object believes it is awake.
-  epaper.begin();
+  setupPanel(coldBoot);
 #endif
 
-  const bool coldBoot = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER);
   if (coldBoot) {
     rtcWakeCount = 0;
     addLog("XIAO weather app booting.");
@@ -3062,7 +3528,7 @@ void loop()
   }
 
   if (!apModeActive && WiFi.status() == WL_CONNECTED && forecastValid &&
-      (millis() - lastRefreshMs) > kRefreshIntervalMs) {
+      (millis() - lastRefreshMs) > refreshIntervalMs()) {
     refreshForecastAndDisplay();
   }
 
@@ -3088,14 +3554,20 @@ void loop()
     }
   }
 
-  // Once the awake window expires, sleep until the next scheduled update. Never
+  // Sleep once the awake window expires, or unconditionally once the cap is hit
+  // so that continuous traffic cannot hold the device up indefinitely. Never
   // sleep in AP mode: the captive portal has to stay up for as long as the user
   // needs it. A failed forecast retries sooner than the normal cycle.
-  if (deepSleepEnabled && !apModeActive && static_cast<int32_t>(millis() - awakeUntilMs) > 0) {
+  const bool awakeWindowExpired = static_cast<int32_t>(millis() - awakeUntilMs) > 0;
+  const bool awakeCapReached = millis() > kMaxAwakeMs;
+  if (deepSleepEnabled && !apModeActive && (awakeWindowExpired || awakeCapReached)) {
+    if (awakeCapReached && !awakeWindowExpired) {
+      addLog("Awake cap reached; sleeping despite recent web activity.");
+    }
     const uint32_t elapsedMs = millis();
-    const uint32_t cycleMs = forecastValid ? kRefreshIntervalMs : kRetrySleepMs;
+    const uint32_t cycleMs = forecastValid ? refreshIntervalMs() : kRetrySleepMs;
     // Subtract the time this wake cycle already burned so the render-to-render
-    // period stays at kRefreshIntervalMs rather than drifting by the boot time.
+    // period stays at the configured interval rather than drifting by boot time.
     enterDeepSleep((cycleMs > elapsedMs) ? (cycleMs - elapsedMs) : 1000UL);
   }
 }

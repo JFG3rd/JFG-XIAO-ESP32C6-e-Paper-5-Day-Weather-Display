@@ -34,8 +34,24 @@ inline constexpr int8_t kBatterySclPin = D5;
 
 // Nominal pack capacity in mAh, used to pick the gauge's APA profile. Must be
 // one of 100, 200, 500, 1000, 2000, 3000 - the values the LC709203F supports.
-// The cell shipped with the driver board is 1000 mAh.
-inline constexpr uint16_t kBatteryPackMah = 1000;
+// 500 is the nearest profile for the 400 mAh cell in use.
+inline constexpr uint16_t kBatteryPackMah = 500;
+
+// --- Modeled charge estimate (used when no gauge is fitted) ------------------
+// With nothing to measure, the firmware still knows exactly how long it spent
+// awake and asleep, so it integrates that against these assumed currents to
+// estimate remaining charge. The result is always shown with a "?" to mark it
+// as a guess rather than a measurement.
+//
+// Actual pack capacity in mAh. Unlike kBatteryPackMah this is not restricted to
+// the gauge's profile steps, so set it to the true value.
+inline constexpr uint16_t kBatteryCapacityMah = 400;
+// Average draw while awake: MCU + Wi-Fi associated, plus the panel refresh.
+inline constexpr uint16_t kEstimatedActiveMa = 90;
+// Whole-board draw in deep sleep. This is the least certain number here - the
+// driver board's boost converter, not the MCU, dominates it. Measure once with a
+// multimeter in series with the pack and correct this if the estimate drifts.
+inline constexpr uint16_t kEstimatedSleepUa = 200;
 
 // Thermistor B-constant. 0 = no thermistor on the pack, so the gauge is told to
 // use its I2C temperature register instead. Adafruit's 10K NTC is B = 3950.
