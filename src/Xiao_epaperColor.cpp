@@ -11,6 +11,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <Update.h>
 #include <Wire.h>
 #include <time.h>
 
@@ -112,8 +113,32 @@ uint32_t lastWebRequestMs = 0;
 // Deep sleep can be disabled from the web UI to keep the device permanently
 // reachable for debugging. Persisted in NVS so it survives the sleep/reboot cycle.
 bool deepSleepEnabled = true;
+// True while an OTA upload is in flight. Deep sleep is suppressed entirely for
+// the duration: sleeping mid-flash would leave a half-written app partition.
+bool otaInProgress = false;
 // Minutes between forecast refreshes, set from the web UI and persisted in NVS.
 uint16_t refreshIntervalMinutes = kDefaultRefreshMinutes;
+// Location and timezone, all web-configurable and NVS-backed. Defaults come from
+// weather_config.h so a fresh device behaves exactly as before.
+float currentLatitude = weather_config::kDefaultLatitude;
+float currentLongitude = weather_config::kDefaultLongitude;
+String currentLocationLabel = weather_config::kLocationLabel;
+String currentTimezone = weather_config::kDefaultTimezone;
+// Display units.
+bool useFahrenheit = false;
+bool useMph = false;
+// Quiet hours: skip refreshes overnight. Removing ~8 of 24 daily wake cycles is
+// the single largest battery saving available after the awake window itself.
+bool quietHoursEnabled = false;
+uint8_t quietStartHour = 23;
+uint8_t quietEndHour = 6;
+// Low-battery behaviour: warn on the panel and stretch the refresh interval.
+bool batteryWarnEnabled = true;
+uint8_t batteryWarnPercent = 20;
+
+// Defined further down with the other power helpers; the header renderer needs
+// it before that point to draw the low-battery strip.
+bool batteryIsLow();
 uint8_t reconnectFailures = 0;
 uint8_t lastDisconnectReason = 0;
 uint32_t lastScanCacheMs = 0;
@@ -149,7 +174,10 @@ struct Coordinates
   float latitude;
   float longitude;
   const char* label;
+  // IANA name, for the weather API's timezone parameter.
   const char* timezone;
+  // POSIX TZ string, for configTzTime(). See kTimeZones for why these differ.
+  const char* posixTz;
 };
 
 struct ForecastDay
@@ -289,6 +317,20 @@ struct UiText
   const char* refreshIntervalLabel;
   const char* batteryChargedButton;
   const char* batteryEstimatedNote;
+  const char* settingsTitle;
+  const char* locationLabelText;
+  const char* latitudeLabel;
+  const char* longitudeLabel;
+  const char* timezoneLabel;
+  const char* unitsLabel;
+  const char* quietHoursLabel;
+  const char* quietFromLabel;
+  const char* quietToLabel;
+  const char* batteryWarnLabel;
+  const char* saveButton;
+  const char* otaTitle;
+  const char* otaHint;
+  const char* otaButton;
   const char* batteryUnknown;
   const char* sleepModeLabel;
   const char* sleepModeHint;
@@ -351,6 +393,20 @@ const UiText kUiText[] = {
         "Refresh every",
         "Battery charged",
         "estimated",
+        "Settings",
+        "Location name",
+        "Latitude",
+        "Longitude",
+        "Time zone",
+        "Units",
+        "Quiet hours (skip night refreshes)",
+        "From",
+        "To",
+        "Warn and conserve below",
+        "Save",
+        "Firmware Update",
+        "Upload a firmware .bin built for this board. The device reboots when it verifies.",
+        "Upload firmware",
         "No sensor",
         "Deep sleep between updates",
         "Off keeps this page always reachable.",
@@ -412,6 +468,20 @@ const UiText kUiText[] = {
         "Aktualisieren alle",
         "Batterie geladen",
         "geschaetzt",
+        "Einstellungen",
+        "Ortsname",
+        "Breitengrad",
+        "Laengengrad",
+        "Zeitzone",
+        "Einheiten",
+        "Ruhezeiten (keine Updates nachts)",
+        "Von",
+        "Bis",
+        "Warnen und sparen unter",
+        "Speichern",
+        "Firmware-Update",
+        "Firmware .bin fuer dieses Board hochladen. Das Geraet startet nach der Pruefung neu.",
+        "Firmware hochladen",
         "Kein Sensor",
         "Tiefschlaf zwischen Updates",
         "Aus haelt diese Seite dauerhaft erreichbar.",
@@ -473,6 +543,20 @@ const UiText kUiText[] = {
         "Actualizar cada",
         "Bateria cargada",
         "estimado",
+        "Ajustes",
+        "Nombre del lugar",
+        "Latitud",
+        "Longitud",
+        "Zona horaria",
+        "Unidades",
+        "Horas de silencio (sin refrescos de noche)",
+        "Desde",
+        "Hasta",
+        "Avisar y ahorrar por debajo de",
+        "Guardar",
+        "Actualizacion de firmware",
+        "Suba un .bin compilado para esta placa. El dispositivo se reinicia al verificarlo.",
+        "Subir firmware",
         "Sin sensor",
         "Suspension entre actualizaciones",
         "Desactivado mantiene esta pagina siempre accesible.",
@@ -534,6 +618,20 @@ const UiText kUiText[] = {
         "Actualiser toutes les",
         "Batterie chargee",
         "estime",
+        "Parametres",
+        "Nom du lieu",
+        "Latitude",
+        "Longitude",
+        "Fuseau horaire",
+        "Unites",
+        "Heures calmes (pas de mise a jour la nuit)",
+        "De",
+        "A",
+        "Alerter et economiser sous",
+        "Enregistrer",
+        "Mise a jour du firmware",
+        "Televersez un .bin compile pour cette carte. Lappareil redemarre apres verification.",
+        "Televerser le firmware",
         "Pas de capteur",
         "Veille profonde entre les mises a jour",
         "Desactive garde cette page toujours accessible.",
@@ -856,15 +954,74 @@ String weatherLabel(const ForecastDay& day)
   return F("N/A");
 }
 
-Coordinates resolveCoordinates()
+// A timezone needs two different strings, and using the wrong one is the bug
+// this table exists to prevent:
+//
+//   * Open-Meteo's &timezone= parameter wants the IANA name ("Europe/Berlin").
+//   * configTzTime() ends up in newlib's tzset(), which only parses POSIX TZ
+//     strings ("CET-1CEST,M3.5.0,M10.5.0/3"). There is no tzdata on the device,
+//     so handing it an IANA name silently yields UTC - which is exactly what the
+//     firmware did before this table existed, displaying time two hours behind
+//     local in a European summer.
+struct TimeZoneOption
 {
-  return {weather_config::kDefaultLatitude, weather_config::kDefaultLongitude, weather_config::kLocationLabel,
-          weather_config::kDefaultTimezone};
+  const char* label;
+  const char* iana;
+  const char* posix;
+};
+
+const TimeZoneOption kTimeZones[] = {
+    {"UTC", "UTC", "UTC0"},
+    {"Europe/London", "Europe/London", "GMT0BST,M3.5.0/1,M10.5.0"},
+    {"Europe/Lisbon", "Europe/Lisbon", "WET0WEST,M3.5.0/1,M10.5.0"},
+    {"Europe/Berlin", "Europe/Berlin", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Europe/Paris", "Europe/Paris", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Europe/Madrid", "Europe/Madrid", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Europe/Rome", "Europe/Rome", "CET-1CEST,M3.5.0,M10.5.0/3"},
+    {"Europe/Athens", "Europe/Athens", "EET-2EEST,M3.5.0/3,M10.5.0/4"},
+    {"Europe/Moscow", "Europe/Moscow", "MSK-3"},
+    {"America/New_York", "America/New_York", "EST5EDT,M3.2.0,M11.1.0"},
+    {"America/Chicago", "America/Chicago", "CST6CDT,M3.2.0,M11.1.0"},
+    {"America/Denver", "America/Denver", "MST7MDT,M3.2.0,M11.1.0"},
+    {"America/Phoenix", "America/Phoenix", "MST7"},
+    {"America/Los_Angeles", "America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0"},
+    {"Asia/Kolkata", "Asia/Kolkata", "IST-5:30"},
+    {"Asia/Shanghai", "Asia/Shanghai", "CST-8"},
+    {"Asia/Tokyo", "Asia/Tokyo", "JST-9"},
+    {"Australia/Sydney", "Australia/Sydney", "AEST-10AEDT,M10.1.0,M4.1.0/3"},
+    {"Pacific/Auckland", "Pacific/Auckland", "NZST-12NZDT,M9.5.0,M4.1.0/3"},
+};
+constexpr uint8_t kTimeZoneCount = sizeof(kTimeZones) / sizeof(kTimeZones[0]);
+
+// Look a zone up by IANA name. Persisting the name rather than an index means
+// reordering this table can never silently move someone to another timezone.
+const TimeZoneOption& timeZoneByIana(const String& iana)
+{
+  for (uint8_t i = 0; i < kTimeZoneCount; ++i) {
+    if (iana == kTimeZones[i].iana) {
+      return kTimeZones[i];
+    }
+  }
+  // Fall back to the compile-time default, then to UTC.
+  for (uint8_t i = 0; i < kTimeZoneCount; ++i) {
+    if (String(weather_config::kDefaultTimezone) == kTimeZones[i].iana) {
+      return kTimeZones[i];
+    }
+  }
+  return kTimeZones[0];
 }
 
-bool updateClock(const char* timezone, ForecastData& forecast)
+Coordinates resolveCoordinates()
 {
-  configTzTime(timezone, "pool.ntp.org", "time.nist.gov");
+  const TimeZoneOption& zone = timeZoneByIana(currentTimezone);
+  return {currentLatitude, currentLongitude, currentLocationLabel.c_str(), zone.iana, zone.posix};
+}
+
+// posixTz must be a POSIX TZ string, not an IANA name - newlib's tzset() cannot
+// resolve "Europe/Berlin" and silently falls back to UTC if given one.
+bool updateClock(const char* posixTz, ForecastData& forecast)
+{
+  configTzTime(posixTz, "pool.ntp.org", "time.nist.gov");
   struct tm timeInfo = {};
   const uint32_t startedAt = millis();
   while (!getLocalTime(&timeInfo, 250) && (millis() - startedAt) < kNtpTimeoutMs) {
@@ -897,8 +1054,8 @@ String buildForecastUrl(const Coordinates& coordinates)
   url += String(coordinates.longitude, 4);
   url += F("&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max");
   url += F("&forecast_days=5");
-  url += F("&temperature_unit=celsius");
-  url += F("&wind_speed_unit=kmh");
+  url += useFahrenheit ? F("&temperature_unit=fahrenheit") : F("&temperature_unit=celsius");
+  url += useMph ? F("&wind_speed_unit=mph") : F("&wind_speed_unit=kmh");
   url += F("&timezone=");
   url += coordinates.timezone;
   return url;
@@ -942,7 +1099,7 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
     forecast.days[i].precipitationProbability = precipitation[i].isNull() ? 0 : precipitation[i].as<int>();
     forecast.days[i].windSpeed = static_cast<int>(lroundf(windSpeed[i].as<float>()));
   }
-  updateClock(coordinates.timezone, forecast);
+  updateClock(coordinates.posixTz, forecast);
   return true;
 }
 
@@ -1510,6 +1667,12 @@ void renderHeader(const ForecastData& forecast)
   // Use a bold free font for the city name to improve legibility.
   drawFreeFontLeft(forecast.location, 4, 2, &FreeSansBold9pt7b, TFT_YELLOW, TFT_BLACK);
 
+  // A low pack gets a red strip along the bottom of the banner - visible at a
+  // glance from across the room, unlike the small percentage in the glyph.
+  if (batteryIsLow()) {
+    epaper.fillRect(0, kHeaderHeight - 3, displayWidth, 2, TFT_RED);
+  }
+
   // The battery glyph owns the far right of the banner; both text lines stop
   // short of it so nothing runs underneath.
   drawBatteryIcon(displayWidth - kBatteryIconWidth - 4, 4, currentBattery);
@@ -1685,6 +1848,134 @@ void loadSleepPreference()
   preferences.end();
 }
 
+// Location, timezone and unit preferences. Defaults come from weather_config.h,
+// so a device with empty NVS behaves exactly as the compile-time build did.
+void loadDisplayPreferences()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading location/timezone. Using defaults.");
+    return;
+  }
+  currentLatitude = preferences.getFloat("lat", weather_config::kDefaultLatitude);
+  currentLongitude = preferences.getFloat("lon", weather_config::kDefaultLongitude);
+  currentLocationLabel = preferences.getString("loc", weather_config::kLocationLabel);
+  currentTimezone = preferences.getString("tz", weather_config::kDefaultTimezone);
+  useFahrenheit = preferences.getBool("unit_t", false);
+  useMph = preferences.getBool("unit_w", false);
+  preferences.end();
+
+  if (currentLocationLabel.isEmpty()) {
+    currentLocationLabel = weather_config::kLocationLabel;
+  }
+  // Snap an unknown zone back to a known one so configTzTime() is never handed
+  // something tzset() cannot parse.
+  currentTimezone = timeZoneByIana(currentTimezone).iana;
+}
+
+void saveLocationPreference(float latitude, float longitude, const String& label)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving location.");
+    return;
+  }
+  preferences.putFloat("lat", latitude);
+  preferences.putFloat("lon", longitude);
+  preferences.putString("loc", label);
+  preferences.end();
+  currentLatitude = latitude;
+  currentLongitude = longitude;
+  currentLocationLabel = label;
+}
+
+void saveTimezonePreference(const String& iana)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving timezone.");
+    return;
+  }
+  preferences.putString("tz", iana);
+  preferences.end();
+  currentTimezone = iana;
+}
+
+void saveUnitPreferences(bool fahrenheit, bool mph)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving units.");
+    return;
+  }
+  preferences.putBool("unit_t", fahrenheit);
+  preferences.putBool("unit_w", mph);
+  preferences.end();
+  useFahrenheit = fahrenheit;
+  useMph = mph;
+}
+
+void loadPowerPreferences()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading power options. Using defaults.");
+    return;
+  }
+  quietHoursEnabled = preferences.getBool("quiet_on", false);
+  quietStartHour = preferences.getUChar("quiet_s", 23);
+  quietEndHour = preferences.getUChar("quiet_e", 6);
+  batteryWarnEnabled = preferences.getBool("batt_on", true);
+  batteryWarnPercent = preferences.getUChar("batt_pct", 20);
+  preferences.end();
+  if (quietStartHour > 23) quietStartHour = 23;
+  if (quietEndHour > 23) quietEndHour = 6;
+  if (batteryWarnPercent > 100) batteryWarnPercent = 20;
+}
+
+void savePowerPreferences()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving power options.");
+    return;
+  }
+  preferences.putBool("quiet_on", quietHoursEnabled);
+  preferences.putUChar("quiet_s", quietStartHour);
+  preferences.putUChar("quiet_e", quietEndHour);
+  preferences.putBool("batt_on", batteryWarnEnabled);
+  preferences.putUChar("batt_pct", batteryWarnPercent);
+  preferences.end();
+}
+
+// True when the battery is low enough to warrant warning and conserving. Applies
+// to a modelled estimate as well as a measured one - a guess low enough to worry
+// about is still worth acting on.
+bool batteryIsLow()
+{
+  return batteryWarnEnabled && currentBattery.valid && currentBattery.percent <= batteryWarnPercent;
+}
+
+// Is the local hour inside the quiet window? Handles windows that wrap midnight
+// (23->6), which is the normal case.
+bool isQuietHourNow(const struct tm& localTime)
+{
+  if (!quietHoursEnabled || quietStartHour == quietEndHour) {
+    return false;
+  }
+  const uint8_t hour = static_cast<uint8_t>(localTime.tm_hour);
+  if (quietStartHour < quietEndHour) {
+    return hour >= quietStartHour && hour < quietEndHour;
+  }
+  return hour >= quietStartHour || hour < quietEndHour;
+}
+
+// Seconds from now until the quiet window ends, so the device can sleep straight
+// through the night instead of waking every interval to do nothing.
+uint32_t secondsUntilQuietEnds(const struct tm& localTime)
+{
+  int32_t hoursAhead = static_cast<int32_t>(quietEndHour) - localTime.tm_hour;
+  if (hoursAhead <= 0) {
+    hoursAhead += 24;
+  }
+  const int32_t seconds = hoursAhead * 3600 - localTime.tm_min * 60 - localTime.tm_sec;
+  return (seconds > 0) ? static_cast<uint32_t>(seconds) : 60;
+}
+
 uint32_t refreshIntervalMs()
 {
   return static_cast<uint32_t>(refreshIntervalMinutes) * 60UL * 1000UL;
@@ -1775,6 +2066,23 @@ void noteWebActivity()
 }
 
 // <option> list for the refresh-interval selector, marking the active value.
+String buildTimezoneOptions()
+{
+  String options;
+  for (uint8_t i = 0; i < kTimeZoneCount; ++i) {
+    options += "<option value='";
+    options += kTimeZones[i].iana;
+    options += "'";
+    if (currentTimezone == kTimeZones[i].iana) {
+      options += " selected";
+    }
+    options += ">";
+    options += kTimeZones[i].label;
+    options += "</option>";
+  }
+  return options;
+}
+
 String buildRefreshOptions()
 {
   String options;
@@ -2304,6 +2612,30 @@ String buildStatusJson()
   json += panelReady ? "true" : "false";
   json += ",\"refreshMinutes\":";
   json += String(refreshIntervalMinutes);
+  json += ",\"latitude\":";
+  json += String(currentLatitude, 4);
+  json += ",\"longitude\":";
+  json += String(currentLongitude, 4);
+  json += ",\"locationLabel\":\"";
+  json += jsonEscape(currentLocationLabel);
+  json += "\",\"timezone\":\"";
+  json += jsonEscape(currentTimezone);
+  json += "\",\"fahrenheit\":";
+  json += useFahrenheit ? "true" : "false";
+  json += ",\"mph\":";
+  json += useMph ? "true" : "false";
+  json += ",\"quietEnabled\":";
+  json += quietHoursEnabled ? "true" : "false";
+  json += ",\"quietStart\":";
+  json += String(quietStartHour);
+  json += ",\"quietEnd\":";
+  json += String(quietEndHour);
+  json += ",\"batteryWarnEnabled\":";
+  json += batteryWarnEnabled ? "true" : "false";
+  json += ",\"batteryWarnPercent\":";
+  json += String(batteryWarnPercent);
+  json += ",\"batteryLow\":";
+  json += batteryIsLow() ? "true" : "false";
   json += ",\"batteryVolts\":\"";
   json += currentBattery.valid ? batteryVoltsText(currentBattery) : String("");
   json += "\",\"deepSleepEnabled\":";
@@ -2615,6 +2947,51 @@ String buildMainPage()
       </div>
     </div>
     <div class="card">
+      <h2 class="card-title">{{SETTINGS_TITLE}}</h2>
+      <label for="locLabel">{{LOCATION_LABEL}}</label>
+      <input type="text" id="locLabel" maxlength="24">
+      <label for="lat">{{LATITUDE_LABEL}}</label>
+      <input type="number" id="lat" step="0.0001" min="-90" max="90">
+      <label for="lon">{{LONGITUDE_LABEL}}</label>
+      <input type="number" id="lon" step="0.0001" min="-180" max="180">
+      <label for="timezone">{{TIMEZONE_LABEL}}</label>
+      <select id="timezone">{{TIMEZONE_OPTIONS}}</select>
+      <label for="unitTemp">{{UNITS_LABEL}}</label>
+      <select id="unitTemp">
+        <option value="c">&deg;C</option>
+        <option value="f">&deg;F</option>
+      </select>
+      <select id="unitWind">
+        <option value="kmh">km/h</option>
+        <option value="mph">mph</option>
+      </select>
+      <div class="sleep-row">
+        <span>{{QUIET_HOURS_LABEL}}</span>
+        <label class="switch"><input type="checkbox" id="quietEnabled"><span class="slider"></span></label>
+      </div>
+      <label for="quietStart">{{QUIET_FROM_LABEL}}</label>
+      <input type="number" id="quietStart" min="0" max="23">
+      <label for="quietEnd">{{QUIET_TO_LABEL}}</label>
+      <input type="number" id="quietEnd" min="0" max="23">
+      <div class="sleep-row">
+        <span>{{BATTERY_WARN_LABEL}}</span>
+        <label class="switch"><input type="checkbox" id="batteryWarnEnabled"><span class="slider"></span></label>
+      </div>
+      <input type="number" id="batteryWarnPercent" min="0" max="100">
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{OTA_TITLE}}</h2>
+      <div class="sleep-hint">{{OTA_HINT}}</div>
+      <input type="file" id="fwFile" accept=".bin">
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-save" onclick="uploadFirmware()">{{OTA_BUTTON}}</button>
+      </div>
+      <div id="otaProgress" class="sleep-hint"></div>
+    </div>
+    <div class="card">
       <h2 class="card-title">{{LOGS_TITLE}}</h2>
       <div class="log-container">
         <pre id="logs">{{LOADING_LOGS}}</pre>
@@ -2711,6 +3088,25 @@ String buildMainPage()
         makeInfoItem(ui.statusUpdated, status.updated || '-') +
         makeInfoItem(ui.statusBattery, makeBatteryValue(status)) +
         makeInfoItem(ui.statusSleepIn, status.deepSleepEnabled ? `${status.awakeSecondsLeft}s` : '-');
+      // Fill the settings inputs from the device, but never fight a field the
+      // user is currently editing.
+      const setIfIdle = (id, value) => {
+        const el = document.getElementById(id);
+        if (el && document.activeElement !== el) {
+          if (el.type === 'checkbox') { el.checked = !!value; } else { el.value = value; }
+        }
+      };
+      setIfIdle('locLabel', status.locationLabel);
+      setIfIdle('lat', status.latitude);
+      setIfIdle('lon', status.longitude);
+      setIfIdle('timezone', status.timezone);
+      setIfIdle('unitTemp', status.fahrenheit ? 'f' : 'c');
+      setIfIdle('unitWind', status.mph ? 'mph' : 'kmh');
+      setIfIdle('quietEnabled', status.quietEnabled);
+      setIfIdle('quietStart', status.quietStart);
+      setIfIdle('quietEnd', status.quietEnd);
+      setIfIdle('batteryWarnEnabled', status.batteryWarnEnabled);
+      setIfIdle('batteryWarnPercent', status.batteryWarnPercent);
       const sleepToggle = document.getElementById('sleepToggle');
       // Do not fight the user mid-click: only sync the toggle when it is idle.
       if (sleepToggle && document.activeElement !== sleepToggle) {
@@ -2802,6 +3198,57 @@ String buildMainPage()
       alert(await response.text());
       await updateStatus();
     }
+    async function saveSettings() {
+      const label = document.getElementById('locLabel').value.trim();
+      const latitude = parseFloat(document.getElementById('lat').value);
+      const longitude = parseFloat(document.getElementById('lon').value);
+      if (isNaN(latitude) || isNaN(longitude)) { alert('Latitude and longitude are required'); return; }
+      let r = await fetch('/location', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({latitude, longitude, label})
+      });
+      if (!r.ok) { alert(await r.text()); return; }
+      await fetch('/timezone', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({timezone: document.getElementById('timezone').value})
+      });
+      await fetch('/units', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          fahrenheit: document.getElementById('unitTemp').value === 'f',
+          mph: document.getElementById('unitWind').value === 'mph'
+        })
+      });
+      r = await fetch('/powerOptions', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          quietEnabled: document.getElementById('quietEnabled').checked,
+          quietStart: parseInt(document.getElementById('quietStart').value, 10),
+          quietEnd: parseInt(document.getElementById('quietEnd').value, 10),
+          batteryWarnEnabled: document.getElementById('batteryWarnEnabled').checked,
+          batteryWarnPercent: parseInt(document.getElementById('batteryWarnPercent').value, 10)
+        })
+      });
+      alert(await r.text());
+      await updateStatus();
+    }
+    function uploadFirmware() {
+      const input = document.getElementById('fwFile');
+      const out = document.getElementById('otaProgress');
+      if (!input.files.length) { alert('Choose a .bin file first'); return; }
+      const data = new FormData();
+      data.append('firmware', input.files[0]);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/update');
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+          out.textContent = `${Math.round((e.loaded / e.total) * 100)}%`;
+        }
+      };
+      xhr.onload = () => { out.textContent = xhr.responseText; };
+      xhr.onerror = () => { out.textContent = 'Upload failed (connection lost).'; };
+      xhr.send(data);
+    }
     document.getElementById('refreshMinutes').addEventListener('change', setRefreshInterval);
     document.getElementById('sleepToggle').addEventListener('change', setSleepMode);
     document.getElementById('language').addEventListener('change', setLanguage);
@@ -2826,6 +3273,21 @@ String buildMainPage()
   page.replace("{{REFRESH_INTERVAL_LABEL}}", t.refreshIntervalLabel);
   page.replace("{{BATTERY_CHARGED_BUTTON}}", t.batteryChargedButton);
   page.replace("{{BATTERY_ESTIMATED_NOTE}}", t.batteryEstimatedNote);
+  page.replace("{{SETTINGS_TITLE}}", t.settingsTitle);
+  page.replace("{{LOCATION_LABEL}}", t.locationLabelText);
+  page.replace("{{LATITUDE_LABEL}}", t.latitudeLabel);
+  page.replace("{{LONGITUDE_LABEL}}", t.longitudeLabel);
+  page.replace("{{TIMEZONE_LABEL}}", t.timezoneLabel);
+  page.replace("{{UNITS_LABEL}}", t.unitsLabel);
+  page.replace("{{QUIET_HOURS_LABEL}}", t.quietHoursLabel);
+  page.replace("{{QUIET_FROM_LABEL}}", t.quietFromLabel);
+  page.replace("{{QUIET_TO_LABEL}}", t.quietToLabel);
+  page.replace("{{BATTERY_WARN_LABEL}}", t.batteryWarnLabel);
+  page.replace("{{SAVE_BUTTON}}", t.saveButton);
+  page.replace("{{TIMEZONE_OPTIONS}}", buildTimezoneOptions());
+  page.replace("{{OTA_TITLE}}", t.otaTitle);
+  page.replace("{{OTA_HINT}}", t.otaHint);
+  page.replace("{{OTA_BUTTON}}", t.otaButton);
   page.replace("{{REFRESH_OPTIONS}}", buildRefreshOptions());
   page.replace("{{BATTERY_UNKNOWN}}", t.batteryUnknown);
   page.replace("{{BATTERY_LOW_PERCENT}}", String(weather_config::kBatteryLowPercent));
@@ -3181,7 +3643,7 @@ void handleLanguage()
   addLog(String("Language set to ") + lang + ".");
   if (forecastValid) {
     // Recompute the updated timestamp so localized weekday strings refresh too.
-    updateClock(resolveCoordinates().timezone, currentForecast);
+    updateClock(resolveCoordinates().posixTz, currentForecast);
     renderForecast(currentForecast);
   }
   if (apModeActive) {
@@ -3303,6 +3765,174 @@ void handlePanelProbe()
 #endif
 }
 
+// Receive a firmware image chunk by chunk and write it straight to the inactive
+// OTA slot. Requires the dual-app partition table (partitions_ota.csv).
+void handleUpdateUpload()
+{
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    otaInProgress = true;
+    addLog(String("OTA upload started: ") + upload.filename);
+    // UPDATE_SIZE_UNKNOWN lets the library size the write from the free slot.
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      otaInProgress = false;
+      addLog(String("OTA begin failed: ") + Update.errorString());
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    // Keep the awake window alive across a long upload. The sleep gate also
+    // checks otaInProgress, so the hard cap cannot interrupt a flash either.
+    extendAwakeWindow(kAwakeWindowMs);
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      addLog(String("OTA write failed: ") + Update.errorString());
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      addLog(String("OTA image written: ") + upload.totalSize + " bytes.");
+    } else {
+      addLog(String("OTA end failed: ") + Update.errorString());
+    }
+    otaInProgress = false;
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaInProgress = false;
+    addLog("OTA upload aborted.");
+  }
+}
+
+// Runs after the upload completes. Only reboots when the image verified, so a
+// rejected image leaves the running firmware untouched.
+void handleUpdateDone()
+{
+  noteWebActivity();
+  const bool ok = !Update.hasError();
+  server.sendHeader("Connection", "close");
+  if (ok) {
+    server.send(200, "text/plain", "Update OK. Rebooting into the new firmware.");
+    delay(500);
+    ESP.restart();
+  } else {
+    server.send(500, "text/plain", String("Update failed: ") + Update.errorString());
+  }
+}
+
+void handleLocation()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+
+  // Validate before storing: a bad coordinate would otherwise persist and make
+  // every future fetch fail with no obvious cause.
+  if (!doc["latitude"].is<float>() || !doc["longitude"].is<float>()) {
+    server.send(400, "text/plain", "latitude and longitude are required");
+    return;
+  }
+  const float latitude = doc["latitude"].as<float>();
+  const float longitude = doc["longitude"].as<float>();
+  if (latitude < -90.0f || latitude > 90.0f || longitude < -180.0f || longitude > 180.0f) {
+    server.send(400, "text/plain", "Coordinates out of range");
+    return;
+  }
+  String label = doc["label"].as<String>();
+  label.trim();
+  if (label.isEmpty()) {
+    label = weather_config::kLocationLabel;
+  }
+  // The panel header has room for a short name only.
+  if (label.length() > 24) {
+    label = label.substring(0, 24);
+  }
+
+  saveLocationPreference(latitude, longitude, label);
+  addLog(String("Location set to ") + label + " (" + String(latitude, 4) + ", " + String(longitude, 4) + ").");
+  server.send(200, "text/plain", "Location saved. Refreshing forecast.");
+  refreshForecastAndDisplay();
+}
+
+void handleTimezone()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const String iana = doc["timezone"].as<String>();
+  if (iana.isEmpty() || String(timeZoneByIana(iana).iana) != iana) {
+    server.send(400, "text/plain", "Unsupported timezone");
+    return;
+  }
+
+  saveTimezonePreference(iana);
+  addLog(String("Timezone set to ") + iana + ".");
+  server.send(200, "text/plain", String("Timezone set to ") + iana + ".");
+  // Re-run the clock so the header timestamp reflects the new zone immediately.
+  refreshForecastAndDisplay();
+}
+
+void handleUnits()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const bool fahrenheit = doc["fahrenheit"] | false;
+  const bool mph = doc["mph"] | false;
+  saveUnitPreferences(fahrenheit, mph);
+  addLog(String("Units set to ") + (fahrenheit ? "F" : "C") + "/" + (mph ? "mph" : "km/h") + ".");
+  server.send(200, "text/plain", "Units saved. Refreshing forecast.");
+  refreshForecastAndDisplay();
+}
+
+void handlePowerOptions()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+
+  quietHoursEnabled = doc["quietEnabled"] | false;
+  const uint8_t start = doc["quietStart"] | 23;
+  const uint8_t end = doc["quietEnd"] | 6;
+  if (start > 23 || end > 23) {
+    server.send(400, "text/plain", "Hours must be 0-23");
+    return;
+  }
+  quietStartHour = start;
+  quietEndHour = end;
+
+  batteryWarnEnabled = doc["batteryWarnEnabled"] | true;
+  const uint8_t pct = doc["batteryWarnPercent"] | 20;
+  if (pct > 100) {
+    server.send(400, "text/plain", "Percent must be 0-100");
+    return;
+  }
+  batteryWarnPercent = pct;
+
+  savePowerPreferences();
+  addLog(String("Power options: quiet=") + (quietHoursEnabled ? "on" : "off") + " " + quietStartHour +
+         "-" + quietEndHour + ", battery warn=" + (batteryWarnEnabled ? "on" : "off") + " at " +
+         batteryWarnPercent + "%.");
+  server.send(200, "text/plain", "Power options saved.");
+}
+
 void handleBatteryFull()
 {
   noteWebActivity();
@@ -3403,8 +4033,13 @@ void setupWebServer()
   server.on("/refresh", HTTP_POST, handleRefresh);
   server.on("/sleepMode", HTTP_POST, handleSleepMode);
   server.on("/refreshInterval", HTTP_POST, handleRefreshInterval);
+  server.on("/location", HTTP_POST, handleLocation);
+  server.on("/timezone", HTTP_POST, handleTimezone);
+  server.on("/units", HTTP_POST, handleUnits);
+  server.on("/powerOptions", HTTP_POST, handlePowerOptions);
   server.on("/batteryFull", HTTP_POST, handleBatteryFull);
   server.on("/panelProbe", HTTP_GET, handlePanelProbe);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.onNotFound(handleNotFound);
   routesConfigured = true;
@@ -3455,6 +4090,8 @@ void setupRuntime()
   loadLanguagePreference();
   loadSleepPreference();
   loadRefreshPreference();
+  loadDisplayPreferences();
+  loadPowerPreferences();
   loadConsumedCharge();
   loadStaticIpConfig();
   setupWebServer();
@@ -3560,12 +4197,32 @@ void loop()
   // needs it. A failed forecast retries sooner than the normal cycle.
   const bool awakeWindowExpired = static_cast<int32_t>(millis() - awakeUntilMs) > 0;
   const bool awakeCapReached = millis() > kMaxAwakeMs;
-  if (deepSleepEnabled && !apModeActive && (awakeWindowExpired || awakeCapReached)) {
+  if (deepSleepEnabled && !apModeActive && !otaInProgress && (awakeWindowExpired || awakeCapReached)) {
     if (awakeCapReached && !awakeWindowExpired) {
       addLog("Awake cap reached; sleeping despite recent web activity.");
     }
     const uint32_t elapsedMs = millis();
-    const uint32_t cycleMs = forecastValid ? refreshIntervalMs() : kRetrySleepMs;
+    uint32_t cycleMs = forecastValid ? refreshIntervalMs() : kRetrySleepMs;
+
+    // Stretch the interval when the pack is nearly flat, so the display keeps
+    // working (less often) instead of dying sooner.
+    if (forecastValid && batteryIsLow()) {
+      cycleMs *= 3;
+      addLog(String("Battery at ") + currentBattery.percent + "%; tripling the refresh interval.");
+    }
+
+    // Sleep straight through the quiet window rather than waking each interval
+    // to render a forecast nobody is awake to read. Only trust this with a valid
+    // clock - never extend a sleep based on a bad timestamp.
+    struct tm localTime = {};
+    if (forecastValid && quietHoursEnabled && getLocalTime(&localTime, 100) && isQuietHourNow(localTime)) {
+      const uint32_t quietMs = secondsUntilQuietEnds(localTime) * 1000UL;
+      if (quietMs > cycleMs) {
+        addLog(String("Quiet hours: sleeping ") + (quietMs / 60000) + " min until " + quietEndHour + ":00.");
+        cycleMs = quietMs;
+      }
+    }
+
     // Subtract the time this wake cycle already burned so the render-to-render
     // period stays at the configured interval rather than drifting by boot time.
     enterDeepSleep((cycleMs > elapsedMs) ? (cycleMs - elapsedMs) : 1000UL);
