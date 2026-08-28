@@ -8,3 +8,7 @@
 # Vendored Seeed_GFX: examples are 43MB of bitmap headers for panels this
 # project does not use, and are not needed to build.
 lib/Seeed_GFX/examples/
+
+# Build artifacts staged for release upload; the binary lives on the GitHub
+# release, not in git history.
+dist/

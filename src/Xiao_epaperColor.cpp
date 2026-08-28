@@ -113,6 +113,16 @@ uint32_t lastWebRequestMs = 0;
 // Deep sleep can be disabled from the web UI to keep the device permanently
 // reachable for debugging. Persisted in NVS so it survives the sleep/reboot cycle.
 bool deepSleepEnabled = true;
+// A panel refresh takes ~20 s and blocks the single-threaded web server for all
+// of it. Doing that inline in a settings handler meant the next POST in a burst
+// (the Settings card sends five) arrived while the device could not accept a
+// connection, so those settings were silently dropped - the "changes do not
+// stick" bug. Handlers now request a refresh and return immediately; loop()
+// performs one refresh once the burst has settled.
+bool refreshPending = false;
+uint32_t refreshRequestedMs = 0;
+constexpr uint32_t kRefreshDebounceMs = 2500;
+
 // True while an OTA upload is in flight. Deep sleep is suppressed entirely for
 // the duration: sleeping mid-flash would leave a half-written app partition.
 bool otaInProgress = false;
@@ -2380,6 +2390,16 @@ void extendAwakeWindow(uint32_t windowMs)
 // Push back the deep sleep deadline. Call this from web handlers only - it
 // counts and logs the request. Non-HTTP callers that just want to hold the
 // device awake should call extendAwakeWindow() directly.
+// Queue a forecast refresh + redraw instead of doing it inline. Collapses a
+// burst of settings changes into a single render, which also saves ~80 s of
+// awake time per save compared with rendering once per setting.
+void requestRefresh()
+{
+  refreshPending = true;
+  refreshRequestedMs = millis();
+  extendAwakeWindow(kAwakeWindowMs);
+}
+
 void noteWebActivity()
 {
   // Log the first request after a quiet spell, with the client and path. That is
@@ -3995,15 +4015,13 @@ void handleLanguage()
 
   saveLanguagePreference(lang);
   addLog(String("Language set to ") + lang + ".");
-  if (forecastValid) {
-    // Recompute the updated timestamp so localized weekday strings refresh too.
-    updateClock(resolveCoordinates().posixTz, currentForecast);
-    renderForecast(currentForecast);
-  }
   if (apModeActive) {
     rebuildCaptivePageCache();
   }
   server.send(200, "text/plain", "Language updated.");
+  // Queue rather than render inline: the timestamp and weekday strings need
+  // re-localizing, but blocking here stalls the rest of the settings burst.
+  requestRefresh();
 }
 
 void handleForgetWiFi()
@@ -4047,11 +4065,10 @@ bool refreshForecastAndDisplay()
 void handleRefresh()
 {
   noteWebActivity();
-  if (refreshForecastAndDisplay()) {
-    server.send(200, "text/plain", "Forecast refreshed.");
-  } else {
-    server.send(500, "text/plain", "Forecast refresh failed.");
-  }
+  // Queued rather than performed inline, so the ~20 s panel refresh cannot block
+  // other requests. The result shows up in /logs and on the panel.
+  requestRefresh();
+  server.send(200, "text/plain", "Forecast refresh queued.");
 }
 
 void handleSleepMode()
@@ -4216,7 +4233,7 @@ void handleLocation()
   saveLocationPreference(latitude, longitude, toDisplayAscii(label));
   addLog(String("Location set to ") + label + " (" + String(latitude, 4) + ", " + String(longitude, 4) + ").");
   server.send(200, "text/plain", "Location saved. Refreshing forecast.");
-  refreshForecastAndDisplay();
+  requestRefresh();
 }
 
 void handleTimezone()
@@ -4236,8 +4253,8 @@ void handleTimezone()
   saveTimezonePreference(iana);
   addLog(String("Timezone set to ") + iana + ".");
   server.send(200, "text/plain", String("Timezone set to ") + iana + ".");
-  // Re-run the clock so the header timestamp reflects the new zone immediately.
-  refreshForecastAndDisplay();
+  // Re-run the clock so the header timestamp reflects the new zone.
+  requestRefresh();
 }
 
 void handleUnits()
@@ -4253,7 +4270,7 @@ void handleUnits()
   saveUnitPreferences(fahrenheit, mph);
   addLog(String("Units set to ") + (fahrenheit ? "F" : "C") + "/" + (mph ? "mph" : "km/h") + ".");
   server.send(200, "text/plain", "Units saved. Refreshing forecast.");
-  refreshForecastAndDisplay();
+  requestRefresh();
 }
 
 void handlePowerOptions()
@@ -4307,7 +4324,7 @@ void handleWarningSource()
   saveWarningPreference(source);
   addLog(String("Warning source set to ") + source + ".");
   server.send(200, "text/plain", String("Warning source set to ") + source + ".");
-  refreshForecastAndDisplay();
+  requestRefresh();
 }
 
 void handleBatteryFull()
@@ -4576,13 +4593,20 @@ void loop()
     }
   }
 
+  // Perform a queued refresh once the burst of settings changes has settled.
+  if (refreshPending && (millis() - refreshRequestedMs) > kRefreshDebounceMs) {
+    refreshPending = false;
+    refreshForecastAndDisplay();
+  }
+
   // Sleep once the awake window expires, or unconditionally once the cap is hit
   // so that continuous traffic cannot hold the device up indefinitely. Never
   // sleep in AP mode: the captive portal has to stay up for as long as the user
   // needs it. A failed forecast retries sooner than the normal cycle.
   const bool awakeWindowExpired = static_cast<int32_t>(millis() - awakeUntilMs) > 0;
   const bool awakeCapReached = millis() > kMaxAwakeMs;
-  if (deepSleepEnabled && !apModeActive && !otaInProgress && (awakeWindowExpired || awakeCapReached)) {
+  if (deepSleepEnabled && !apModeActive && !otaInProgress && !refreshPending &&
+      (awakeWindowExpired || awakeCapReached)) {
     if (awakeCapReached && !awakeWindowExpired) {
       addLog("Awake cap reached; sleeping despite recent web activity.");
     }
