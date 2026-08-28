@@ -139,6 +139,19 @@ uint8_t batteryWarnPercent = 20;
 // Defined further down with the other power helpers; the header renderer needs
 // it before that point to draw the low-battery strip.
 bool batteryIsLow();
+// Defined with the other text helpers; the alert fetcher above it needs to fold
+// API text to ASCII before it reaches the panel.
+String toDisplayAscii(const String& text);
+
+// Where header warnings come from: "off", "derived" (our own thresholds on the
+// forecast we already fetch) or "dwd" (official DWD alerts via Bright Sky).
+String warningSource = "derived";
+// Text of the active warning, empty when none. Recomputed on each refresh.
+String activeWarning;
+// True when the header should show SSID/IP instead of weather: set on a cold
+// boot, or when the IP differs from the one last seen. The address is only worth
+// screen space when it is new information.
+bool showNetworkInfo = true;
 uint8_t reconnectFailures = 0;
 uint8_t lastDisconnectReason = 0;
 uint32_t lastScanCacheMs = 0;
@@ -317,6 +330,15 @@ struct UiText
   const char* refreshIntervalLabel;
   const char* batteryChargedButton;
   const char* batteryEstimatedNote;
+  const char* warnStorm;
+  const char* warnWind;
+  const char* warnRain;
+  const char* warnFrost;
+  const char* warnHeat;
+  const char* warningSourceLabel;
+  const char* warnSourceOff;
+  const char* warnSourceDerived;
+  const char* warnSourceDwd;
   const char* settingsTitle;
   const char* locationLabelText;
   const char* latitudeLabel;
@@ -393,6 +415,15 @@ const UiText kUiText[] = {
         "Refresh every",
         "Battery charged",
         "estimated",
+        "STORM",
+        "WIND",
+        "RAIN",
+        "FROST",
+        "HEAT",
+        "Weather warnings",
+        "Off",
+        "From forecast",
+        "Official (DWD)",
         "Settings",
         "Location name",
         "Latitude",
@@ -468,6 +499,15 @@ const UiText kUiText[] = {
         "Aktualisieren alle",
         "Batterie geladen",
         "geschaetzt",
+        "GEWITTER",
+        "STURM",
+        "REGEN",
+        "FROST",
+        "HITZE",
+        "Wetterwarnungen",
+        "Aus",
+        "Aus Vorhersage",
+        "Amtlich (DWD)",
         "Einstellungen",
         "Ortsname",
         "Breitengrad",
@@ -543,6 +583,15 @@ const UiText kUiText[] = {
         "Actualizar cada",
         "Bateria cargada",
         "estimado",
+        "TORMENTA",
+        "VIENTO",
+        "LLUVIA",
+        "HELADA",
+        "CALOR",
+        "Avisos meteorologicos",
+        "Desactivado",
+        "De la prevision",
+        "Oficial (DWD)",
         "Ajustes",
         "Nombre del lugar",
         "Latitud",
@@ -618,6 +667,15 @@ const UiText kUiText[] = {
         "Actualiser toutes les",
         "Batterie chargee",
         "estime",
+        "ORAGE",
+        "VENT",
+        "PLUIE",
+        "GEL",
+        "CANICULE",
+        "Alertes meteo",
+        "Desactive",
+        "De la prevision",
+        "Officiel (DWD)",
         "Parametres",
         "Nom du lieu",
         "Latitude",
@@ -1103,6 +1161,132 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
   return true;
 }
 
+// Our own read of today's forecast. Deliberately conservative: one line of text,
+// most severe condition wins. These are not official warnings and the labels say
+// so - kAlertsHost / the "dwd" source exists for authoritative ones.
+String deriveWarning(const ForecastDay& today)
+{
+  // Thunderstorm codes outrank everything else.
+  if (today.weatherCode == 95 || today.weatherCode == 96 || today.weatherCode == 99) {
+    return ui().warnStorm;
+  }
+  if (today.windSpeed >= weather_config::kWarnWindKmh) {
+    return String(ui().warnWind) + " " + today.windSpeed;
+  }
+  // Temperature thresholds are compared in Celsius, so skip them when the user
+  // asked for Fahrenheit rather than silently comparing against the wrong scale.
+  if (!useFahrenheit && today.tempMin <= weather_config::kWarnFrostCelsius) {
+    return ui().warnFrost;
+  }
+  if (!useFahrenheit && today.tempMax >= weather_config::kWarnHeatCelsius) {
+    return ui().warnHeat;
+  }
+  if (today.precipitationProbability >= weather_config::kWarnPrecipitationPercent) {
+    return String(ui().warnRain) + " " + today.precipitationProbability + "%";
+  }
+  return String();
+}
+
+uint8_t alertSeverityRank(const char* severity)
+{
+  if (severity == nullptr) {
+    return 0;
+  }
+  if (strcmp(severity, "extreme") == 0) return 4;
+  if (strcmp(severity, "severe") == 0) return 3;
+  if (strcmp(severity, "moderate") == 0) return 2;
+  if (strcmp(severity, "minor") == 0) return 1;
+  return 0;
+}
+
+// Official DWD warnings via Bright Sky. Plain HTTP, so no TLS heap. Returns an
+// empty string outside DWD coverage or when nothing is active, which the caller
+// treats as "no warning" rather than an error.
+String fetchDwdWarning()
+{
+  String url = weather_config::kAlertsHost;
+  url += "?lat=";
+  url += String(currentLatitude, 4);
+  url += "&lon=";
+  url += String(currentLongitude, 4);
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(kHttpTimeoutMs);
+  if (!http.begin(client, url)) {
+    addLog("Alerts HTTP begin failed.");
+    return String();
+  }
+  const int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    addLog(String("Alerts request failed: HTTP ") + httpCode);
+    http.end();
+    return String();
+  }
+
+  // Each alert carries long description_* and instruction_* strings; a busy
+  // weather day would blow the heap if the whole document were materialised.
+  // The filter admits only the two fields actually rendered.
+  JsonDocument filter;
+  JsonObject alertFilter = filter["alerts"].add<JsonObject>();
+  alertFilter["severity"] = true;
+  alertFilter["event_en"] = true;
+  alertFilter["event_de"] = true;
+
+  JsonDocument doc;
+  const DeserializationError error =
+      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    addLog(String("Alerts JSON parse failed: ") + error.c_str());
+    return String();
+  }
+
+  const JsonArray alerts = doc["alerts"].as<JsonArray>();
+  if (alerts.isNull() || alerts.size() == 0) {
+    return String();
+  }
+
+  // Most severe wins; Bright Sky offers only English and German event names, so
+  // Spanish and French fall back to English.
+  const bool german = (currentLanguage == UiLanguage::German);
+  uint8_t bestRank = 0;
+  String bestEvent;
+  for (JsonObject alert : alerts) {
+    const uint8_t rank = alertSeverityRank(alert["severity"].as<const char*>());
+    if (rank < bestRank) {
+      continue;
+    }
+    const char* event = german ? alert["event_de"].as<const char*>() : alert["event_en"].as<const char*>();
+    if (event == nullptr) {
+      event = alert["event_en"].as<const char*>();
+    }
+    if (event != nullptr) {
+      bestRank = rank;
+      bestEvent = event;
+    }
+  }
+  if (!bestEvent.isEmpty()) {
+    addLog(String("DWD alert: ") + bestEvent);
+  }
+  // Alert names come from DWD in German and routinely contain umlauts.
+  return toDisplayAscii(bestEvent);
+}
+
+// Recompute the header warning for this refresh, per the configured source.
+void updateActiveWarning(const ForecastData& forecast)
+{
+  activeWarning = "";
+  if (warningSource == "off") {
+    return;
+  }
+  if (warningSource == "dwd") {
+    activeWarning = fetchDwdWarning();
+    return;
+  }
+  activeWarning = deriveWarning(forecast.days[0]);
+}
+
 bool fetchForecast(ForecastData& forecast)
 {
   const Coordinates coordinates = resolveCoordinates();
@@ -1300,6 +1484,68 @@ void drawFreeFontLeft(const String& text, int32_t x, int32_t y, const GFXfont* f
   epaper.setTextDatum(TL_DATUM);
   epaper.drawString(text, x, y);
   epaper.setFreeFont(nullptr);
+}
+
+// Fold UTF-8 accented Latin characters down to ASCII for the panel.
+//
+// TFT_eSPI decodes UTF-8 into a code point, but the GLCD font is a 256-glyph
+// CP437-style set: U+00D6 lands on a box-drawing character, not "OE". Every
+// string this project authors already avoids umlauts for exactly that reason
+// ("Laengengrad", "Schlaeft in"), but text we do not control - DWD alert names
+// like "STURMBOEEN", a location label someone types - has to be folded here or
+// it renders as garbage.
+String toDisplayAscii(const String& text)
+{
+  struct Mapping
+  {
+    uint16_t code;
+    const char* ascii;
+  };
+  static const Mapping kMappings[] = {
+      {0x00C4, "AE"}, {0x00D6, "OE"}, {0x00DC, "UE"}, {0x00E4, "ae"}, {0x00F6, "oe"},
+      {0x00FC, "ue"}, {0x00DF, "ss"}, {0x00C0, "A"},  {0x00C1, "A"},  {0x00C2, "A"},
+      {0x00C8, "E"},  {0x00C9, "E"},  {0x00CA, "E"},  {0x00CD, "I"},  {0x00D3, "O"},
+      {0x00D4, "O"},  {0x00DA, "U"},  {0x00E0, "a"},  {0x00E1, "a"},  {0x00E2, "a"},
+      {0x00E7, "c"},  {0x00E8, "e"},  {0x00E9, "e"},  {0x00EA, "e"},  {0x00ED, "i"},
+      {0x00F3, "o"},  {0x00F4, "o"},  {0x00F1, "n"},  {0x00FA, "u"},
+  };
+  constexpr uint8_t kMappingCount = sizeof(kMappings) / sizeof(kMappings[0]);
+
+  String out;
+  out.reserve(text.length());
+  for (uint16_t i = 0; i < text.length(); ++i) {
+    const uint8_t c = static_cast<uint8_t>(text[i]);
+    if (c < 0x80) {
+      out += static_cast<char>(c);
+      continue;
+    }
+    // Two-byte UTF-8 covers the whole Latin-1 supplement, which is all the
+    // accented text these APIs produce.
+    if ((c & 0xE0) == 0xC0 && (i + 1) < text.length()) {
+      const uint16_t code = ((c & 0x1F) << 6) | (static_cast<uint8_t>(text[i + 1]) & 0x3F);
+      ++i;
+      bool mapped = false;
+      for (uint8_t m = 0; m < kMappingCount; ++m) {
+        if (kMappings[m].code == code) {
+          out += kMappings[m].ascii;
+          mapped = true;
+          break;
+        }
+      }
+      if (!mapped) {
+        out += '?';
+      }
+      continue;
+    }
+    // Longer sequences (and stray continuation bytes) have no ASCII equivalent.
+    if ((c & 0xF0) == 0xE0) {
+      i += 2;
+    } else if ((c & 0xF8) == 0xF0) {
+      i += 3;
+    }
+    out += '?';
+  }
+  return out;
 }
 
 // Clamps text to a maximum pixel width, appending "..." when needed.
@@ -1548,8 +1794,18 @@ void loadConsumedCharge()
 // Add one cycle's charge to the running total and persist it. Called from
 // enterDeepSleep(), the one place that knows both how long this wake stayed
 // awake and how long the coming sleep will be.
+//
+// Skipped entirely when a fuel gauge is present: the modelled figure is unused
+// then, so accumulating it would only cost an NVS write every sleep cycle. If a
+// gauge later disappears the stored value resumes from where it stopped and will
+// read optimistically - the "Battery charged" button is the reset for that, and
+// the "?" marker already flags the number as a guess.
 void accumulateConsumedCharge(uint32_t awakeMs, uint32_t sleepMs)
 {
+  if (batteryGaugeReady) {
+    return;
+  }
+
   // mA * ms -> uAh:  mA * 1000 = uA;  ms / 3600000 = h.
   const uint64_t activeUah =
       (static_cast<uint64_t>(weather_config::kEstimatedActiveMa) * 1000ULL * awakeMs) / 3600000ULL;
@@ -1678,16 +1934,40 @@ void renderHeader(const ForecastData& forecast)
   drawBatteryIcon(displayWidth - kBatteryIconWidth - 4, 4, currentBattery);
   const uint16_t textRightEdge = displayWidth - kBatteryIconMargin;
 
-  // Right-align Wi-Fi status on the first header line to avoid overlap with the title.
-  const String wifiName = currentSsid.isEmpty() ? String("AP") : currentSsid;
-  const String ipText = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("--.--.--.--");
-  const String wifiLabel = String(ui().labelWifi) + ": " + wifiName + " " + ipText;
+  // The first header line is a priority stack rather than a fixed field. The
+  // SSID and IP are only worth ~190px of panel while they are new information -
+  // after that the same space carries weather that changes every cycle.
+  //
+  //   1. network info  - cold boot, or the IP moved since last time
+  //   2. warning       - red, when a warning source is enabled and something fired
+  //   3. today         - the everyday case
+  //
+  // Network info outranks a warning because it is rare, self-clearing, and the
+  // only way to find a device whose address changed; missing one warning cycle
+  // after a power cut is the cheaper trade.
+  String headerLine;
+  uint16_t headerColor = TFT_YELLOW;
+  if (showNetworkInfo) {
+    const String wifiName = currentSsid.isEmpty() ? String("AP") : currentSsid;
+    const String ipText =
+        (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : String("--.--.--.--");
+    headerLine = String(ui().labelWifi) + ": " + wifiName + " " + ipText;
+  } else if (!activeWarning.isEmpty()) {
+    headerLine = activeWarning;
+    headerColor = TFT_RED;
+  } else {
+    const ForecastDay& today = forecast.days[0];
+    headerLine = weatherLabel(today) + " " + today.tempMax + "/" + today.tempMin;
+    if (today.precipitationProbability > 0) {
+      headerLine += String(" ") + today.precipitationProbability + "%";
+    }
+  }
+
   const uint16_t titleWidth = epaper.textWidth(forecast.location, 2);
-  const uint16_t wifiMaxWidth =
+  const uint16_t headerMaxWidth =
       (textRightEdge > titleWidth + 12) ? (textRightEdge - titleWidth - 12) : 0;
-  // this is where the SSID is drawn, so use yellow to match the city name and stand out against the black banner.
-  epaper.setTextColor(TFT_YELLOW, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(wifiLabel, wifiMaxWidth, 1), textRightEdge, 2, 1);
+  epaper.setTextColor(headerColor, TFT_BLACK);
+  epaper.drawRightString(clampTextToWidth(headerLine, headerMaxWidth, 1), textRightEdge, 2, 1);
 
   // Keep the location on the left and right-align the updated timestamp on the second line.
   const String updatedLabel = String(ui().labelUpdated) + ": " + forecast.updatedDay + " " + forecast.updatedAt;
@@ -1974,6 +2254,57 @@ uint32_t secondsUntilQuietEnds(const struct tm& localTime)
   }
   const int32_t seconds = hoursAhead * 3600 - localTime.tm_min * 60 - localTime.tm_sec;
   return (seconds > 0) ? static_cast<uint32_t>(seconds) : 60;
+}
+
+bool isWarningSourceSupported(const String& source)
+{
+  return source == "off" || source == "derived" || source == "dwd";
+}
+
+void loadWarningPreference()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading warning source. Using default.");
+    return;
+  }
+  const String stored = preferences.getString("warn_src", "derived");
+  preferences.end();
+  if (isWarningSourceSupported(stored)) {
+    warningSource = stored;
+  }
+}
+
+void saveWarningPreference(const String& source)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving warning source.");
+    return;
+  }
+  preferences.putString("warn_src", source);
+  preferences.end();
+  warningSource = source;
+}
+
+// The IP is only interesting when it is new. Compare against the last one stored
+// and, if it moved, show it on the panel for this cycle. NVS rather than RTC
+// memory on purpose: a power cut is exactly when the address matters, and RTC
+// memory does not survive one. Only written when it actually changes.
+void noteCurrentIpAddress()
+{
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  const String ip = WiFi.localIP().toString();
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    return;
+  }
+  const String previous = preferences.getString("last_ip", "");
+  if (previous != ip) {
+    preferences.putString("last_ip", ip);
+    showNetworkInfo = true;
+    addLog(String("IP address changed to ") + ip + "; showing it on the panel this cycle.");
+  }
+  preferences.end();
 }
 
 uint32_t refreshIntervalMs()
@@ -2636,6 +2967,14 @@ String buildStatusJson()
   json += String(batteryWarnPercent);
   json += ",\"batteryLow\":";
   json += batteryIsLow() ? "true" : "false";
+  json += ",\"warningSource\":\"";
+  json += jsonEscape(warningSource);
+  json += "\",\"warningText\":\"";
+  json += jsonEscape(activeWarning);
+  json += "\",\"warningActive\":";
+  json += activeWarning.isEmpty() ? "false" : "true";
+  json += ",\"showNetworkInfo\":";
+  json += showNetworkInfo ? "true" : "false";
   json += ",\"batteryVolts\":\"";
   json += currentBattery.valid ? batteryVoltsText(currentBattery) : String("");
   json += "\",\"deepSleepEnabled\":";
@@ -2956,6 +3295,12 @@ String buildMainPage()
       <input type="number" id="lon" step="0.0001" min="-180" max="180">
       <label for="timezone">{{TIMEZONE_LABEL}}</label>
       <select id="timezone">{{TIMEZONE_OPTIONS}}</select>
+      <label for="warningSource">{{WARNING_SOURCE_LABEL}}</label>
+      <select id="warningSource">
+        <option value="off">{{WARN_SRC_OFF}}</option>
+        <option value="derived">{{WARN_SRC_DERIVED}}</option>
+        <option value="dwd">{{WARN_SRC_DWD}}</option>
+      </select>
       <label for="unitTemp">{{UNITS_LABEL}}</label>
       <select id="unitTemp">
         <option value="c">&deg;C</option>
@@ -3100,6 +3445,7 @@ String buildMainPage()
       setIfIdle('lat', status.latitude);
       setIfIdle('lon', status.longitude);
       setIfIdle('timezone', status.timezone);
+      setIfIdle('warningSource', status.warningSource);
       setIfIdle('unitTemp', status.fahrenheit ? 'f' : 'c');
       setIfIdle('unitWind', status.mph ? 'mph' : 'kmh');
       setIfIdle('quietEnabled', status.quietEnabled);
@@ -3219,6 +3565,10 @@ String buildMainPage()
           mph: document.getElementById('unitWind').value === 'mph'
         })
       });
+      await fetch('/warningSource', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({source: document.getElementById('warningSource').value})
+      });
       r = await fetch('/powerOptions', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -3274,6 +3624,10 @@ String buildMainPage()
   page.replace("{{BATTERY_CHARGED_BUTTON}}", t.batteryChargedButton);
   page.replace("{{BATTERY_ESTIMATED_NOTE}}", t.batteryEstimatedNote);
   page.replace("{{SETTINGS_TITLE}}", t.settingsTitle);
+  page.replace("{{WARNING_SOURCE_LABEL}}", t.warningSourceLabel);
+  page.replace("{{WARN_SRC_OFF}}", t.warnSourceOff);
+  page.replace("{{WARN_SRC_DERIVED}}", t.warnSourceDerived);
+  page.replace("{{WARN_SRC_DWD}}", t.warnSourceDwd);
   page.replace("{{LOCATION_LABEL}}", t.locationLabelText);
   page.replace("{{LATITUDE_LABEL}}", t.latitudeLabel);
   page.replace("{{LONGITUDE_LABEL}}", t.longitudeLabel);
@@ -3684,6 +4038,8 @@ bool refreshForecastAndDisplay()
 
   currentForecast = nextForecast;
   forecastValid = true;
+  // Resolve the header warning before rendering so the panel and /status agree.
+  updateActiveWarning(currentForecast);
   renderForecast(currentForecast);
   return true;
 }
@@ -3856,7 +4212,8 @@ void handleLocation()
     label = label.substring(0, 24);
   }
 
-  saveLocationPreference(latitude, longitude, label);
+  // The label is free text and reaches the panel, so fold it the same way.
+  saveLocationPreference(latitude, longitude, toDisplayAscii(label));
   addLog(String("Location set to ") + label + " (" + String(latitude, 4) + ", " + String(longitude, 4) + ").");
   server.send(200, "text/plain", "Location saved. Refreshing forecast.");
   refreshForecastAndDisplay();
@@ -3931,6 +4288,26 @@ void handlePowerOptions()
          "-" + quietEndHour + ", battery warn=" + (batteryWarnEnabled ? "on" : "off") + " at " +
          batteryWarnPercent + "%.");
   server.send(200, "text/plain", "Power options saved.");
+}
+
+void handleWarningSource()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const String source = doc["source"].as<String>();
+  if (!isWarningSourceSupported(source)) {
+    server.send(400, "text/plain", "Unsupported warning source");
+    return;
+  }
+
+  saveWarningPreference(source);
+  addLog(String("Warning source set to ") + source + ".");
+  server.send(200, "text/plain", String("Warning source set to ") + source + ".");
+  refreshForecastAndDisplay();
 }
 
 void handleBatteryFull()
@@ -4037,6 +4414,7 @@ void setupWebServer()
   server.on("/timezone", HTTP_POST, handleTimezone);
   server.on("/units", HTTP_POST, handleUnits);
   server.on("/powerOptions", HTTP_POST, handlePowerOptions);
+  server.on("/warningSource", HTTP_POST, handleWarningSource);
   server.on("/batteryFull", HTTP_POST, handleBatteryFull);
   server.on("/panelProbe", HTTP_GET, handlePanelProbe);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
@@ -4092,6 +4470,7 @@ void setupRuntime()
   loadRefreshPreference();
   loadDisplayPreferences();
   loadPowerPreferences();
+  loadWarningPreference();
   loadConsumedCharge();
   loadStaticIpConfig();
   setupWebServer();
@@ -4112,6 +4491,7 @@ void setupRuntime()
       addLog("HTTP control server started in station mode.");
     }
     stopApMode();
+    noteCurrentIpAddress();
     refreshForecastAndDisplay();
     return;
   }
@@ -4147,6 +4527,11 @@ void setup()
   // Hold off sleep for the full cold-boot window before anything else can arm a
   // shorter one, so the web UI is always reachable for 5 minutes after a boot.
   extendAwakeWindow(coldBoot ? kColdBootAwakeMs : kAwakeWindowMs);
+
+  // Show SSID/IP on the panel after a power-on or reset - that is when someone is
+  // standing there checking it worked. A timer wake starts with it hidden, and
+  // noteCurrentIpAddress() turns it back on if the address actually moved.
+  showNetworkInfo = coldBoot;
   setupBatteryGauge(coldBoot);
   setupRuntime();
 }

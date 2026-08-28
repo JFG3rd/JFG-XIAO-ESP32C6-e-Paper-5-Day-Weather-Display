@@ -59,4 +59,21 @@ inline constexpr uint16_t kBatteryThermistorB = 0;
 
 // Warn threshold (percent) below which the header glyph turns red.
 inline constexpr uint8_t kBatteryLowPercent = 20;
+
+// --- Derived weather warnings ------------------------------------------------
+// Thresholds for the device's own assessment of today's forecast, used when the
+// warning source is set to "derived". These are our judgement, not official
+// meteorological warnings - the "dwd" source exists for those.
+//
+// All are evaluated against data the daily forecast request already returns, so
+// a derived warning costs no extra HTTP request and no extra awake time.
+inline constexpr int kWarnWindKmh = 60;
+inline constexpr int kWarnPrecipitationPercent = 80;
+inline constexpr int kWarnFrostCelsius = 0;
+inline constexpr int kWarnHeatCelsius = 32;
+
+// Official DWD alerts, served by Bright Sky. Plain HTTP works (verified: returns
+// 200 with no redirect to HTTPS), so this costs no TLS heap. Germany only - the
+// alerts array simply comes back empty elsewhere.
+inline constexpr char kAlertsHost[] = "http://api.brightsky.dev/alerts";
 }  // namespace weather_config
