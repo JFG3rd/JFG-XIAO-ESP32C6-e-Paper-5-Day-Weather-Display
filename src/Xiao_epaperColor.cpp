@@ -400,9 +400,9 @@ struct UiText
   const char* layoutInfo;
   const char* previewTitle;
   const char* previewUnsaved;
+  const char* previewApplying;
   const char* confirmSave;
   const char* creditPrefix;
-  const char* previewRefresh;
   const char* modeOff;
   const char* headerModeNow;
   const char* headerModeRain;
@@ -507,11 +507,11 @@ const UiText kUiText[] = {
         "Location",
         "Temperature + location",
         "Info only",
-        "Panel preview",
+        "Display",
         "Preview of unsaved settings - press Save to apply",
+        "Saved - the panel is redrawing",
         "Do you want to change the settings?",
         "Weather data by",
-        "Reload preview",
         "Off",
         "Feels-like + UV",
         "Rain in mm",
@@ -615,11 +615,11 @@ const UiText kUiText[] = {
         "Ort",
         "Temperatur + Ort",
         "Nur Infos",
-        "Anzeigevorschau",
+        "Anzeige",
         "Vorschau nicht gespeicherter Einstellungen - Speichern zum Uebernehmen",
+        "Gespeichert - Anzeige wird neu gezeichnet",
         "Moechten Sie die Einstellungen aendern?",
         "Wetterdaten von",
-        "Vorschau neu laden",
         "Aus",
         "Gefuehlt + UV",
         "Regen in mm",
@@ -723,11 +723,11 @@ const UiText kUiText[] = {
         "Lugar",
         "Temperatura + lugar",
         "Solo info",
-        "Vista del panel",
+        "Pantalla",
         "Vista previa sin guardar - pulse Guardar para aplicar",
+        "Guardado - la pantalla se esta redibujando",
         "Desea cambiar los ajustes?",
         "Datos meteorologicos de",
-        "Recargar vista",
         "Desactivado",
         "Sensacion + UV",
         "Lluvia en mm",
@@ -831,11 +831,11 @@ const UiText kUiText[] = {
         "Lieu",
         "Temperature + lieu",
         "Infos seules",
-        "Apercu du panneau",
+        "Affichage",
         "Apercu non enregistre - appuyez sur Enregistrer",
+        "Enregistre - le panneau se redessine",
         "Voulez-vous modifier les parametres?",
         "Donnees meteo de",
-        "Recharger lapercu",
         "Desactive",
         "Ressenti + UV",
         "Pluie en mm",
@@ -3877,28 +3877,6 @@ String buildMainPage()
       <input type="number" id="lon" step="0.0001" min="-180" max="180">
       <label for="timezone">{{TIMEZONE_LABEL}}</label>
       <select id="timezone">{{TIMEZONE_OPTIONS}}</select>
-      <label for="layout">{{LAYOUT_LABEL}}</label>
-      <select id="layout">
-        <option value="temp">{{LAYOUT_TEMP}}</option>
-        <option value="location">{{LAYOUT_LOCATION}}</option>
-        <option value="both">{{LAYOUT_BOTH}}</option>
-        <option value="info">{{LAYOUT_INFO}}</option>
-      </select>
-      <label for="headerMode">{{HEADER_MODE_LABEL}}</label>
-      <select id="headerMode">
-        <option value="now">{{HEADER_MODE_NOW}}</option>
-        <option value="rain">{{HEADER_MODE_RAIN}}</option>
-        <option value="sun">{{HEADER_MODE_SUN}}</option>
-        <option value="wind">{{HEADER_MODE_WIND}}</option>
-      </select>
-      <label for="headerMode2">{{HEADER_MODE2_LABEL}}</label>
-      <select id="headerMode2">
-        <option value="off">{{MODE_OFF}}</option>
-        <option value="now">{{HEADER_MODE_NOW}}</option>
-        <option value="rain">{{HEADER_MODE_RAIN}}</option>
-        <option value="sun">{{HEADER_MODE_SUN}}</option>
-        <option value="wind">{{HEADER_MODE_WIND}}</option>
-      </select>
       <label for="warningSource">{{WARNING_SOURCE_LABEL}}</label>
       <select id="warningSource">
         <option value="off">{{WARN_SRC_OFF}}</option>
@@ -3947,10 +3925,32 @@ String buildMainPage()
       <!-- The framebuffer is the panel's native portrait 128x296; rotating here
            avoids second-guessing the sprite's coordinate mapping on the device. -->
       <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="panel"></div>
-      <div class="button-row" style="grid-template-columns:1fr">
-        <button class="btn-nav" onclick="reloadPanel()">{{PREVIEW_REFRESH}}</button>
-      </div>
       <div id="previewNote" class="sleep-hint"></div>
+      <label for="layout">{{LAYOUT_LABEL}}</label>
+      <select id="layout">
+        <option value="temp">{{LAYOUT_TEMP}}</option>
+        <option value="location">{{LAYOUT_LOCATION}}</option>
+        <option value="both">{{LAYOUT_BOTH}}</option>
+        <option value="info">{{LAYOUT_INFO}}</option>
+      </select>
+      <label for="headerMode">{{HEADER_MODE_LABEL}}</label>
+      <select id="headerMode">
+        <option value="now">{{HEADER_MODE_NOW}}</option>
+        <option value="rain">{{HEADER_MODE_RAIN}}</option>
+        <option value="sun">{{HEADER_MODE_SUN}}</option>
+        <option value="wind">{{HEADER_MODE_WIND}}</option>
+      </select>
+      <label for="headerMode2">{{HEADER_MODE2_LABEL}}</label>
+      <select id="headerMode2">
+        <option value="off">{{MODE_OFF}}</option>
+        <option value="now">{{HEADER_MODE_NOW}}</option>
+        <option value="rain">{{HEADER_MODE_RAIN}}</option>
+        <option value="sun">{{HEADER_MODE_SUN}}</option>
+        <option value="wind">{{HEADER_MODE_WIND}}</option>
+      </select>
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
+      </div>
     </div>
     <div class="card">
       <h2 class="card-title">{{OTA_TITLE}}</h2>
@@ -3997,7 +3997,8 @@ String buildMainPage()
       batteryUnknown: '{{BATTERY_UNKNOWN}}',
       batteryEstimatedNote: '{{BATTERY_ESTIMATED_NOTE}}',
       confirmSave: '{{CONFIRM_SAVE}}',
-      previewUnsaved: '{{PREVIEW_UNSAVED}}'
+      previewUnsaved: '{{PREVIEW_UNSAVED}}',
+      previewApplying: '{{PREVIEW_APPLYING}}'
     };
     let currentConnectedSsid = '';
     // Settings inputs are filled from the device only until the first fill
@@ -4262,13 +4263,15 @@ String buildMainPage()
       // value was rejected, this is what makes that visible instead of silent.
       settingsLoaded = false;
       await updateStatus();
-      // The preview now matches what is stored, so show the real panel again.
+      // The panel redraw is queued and takes ~20 s, so /panel.bmp would still show
+      // the old layout right now. Keep the preview up - it already matches what is
+      // being drawn - and swap to the real image once it has had time to land.
       const pnote = document.getElementById('previewNote');
-      if (pnote) { pnote.textContent = ''; }
-    }
-    function reloadPanel() {
-      // Cache-bust: the panel only changes on a render, but the browser cannot know that.
-      document.getElementById('panelImg').src = '/panel.bmp?t=' + Date.now();
+      if (pnote) { pnote.textContent = ui.previewApplying; }
+      setTimeout(() => {
+        document.getElementById('panelImg').src = '/panel.bmp?t=' + Date.now();
+        if (pnote) { pnote.textContent = ''; }
+      }, 26000);
     }
     // Render the form's current values without saving them. The device draws into
     // its buffer and hands back an image; the display itself is never touched.
@@ -4348,9 +4351,9 @@ String buildMainPage()
   page.replace("{{LAYOUT_INFO}}", t.layoutInfo);
   page.replace("{{PREVIEW_TITLE}}", t.previewTitle);
   page.replace("{{PREVIEW_UNSAVED}}", t.previewUnsaved);
+  page.replace("{{PREVIEW_APPLYING}}", t.previewApplying);
   page.replace("{{CONFIRM_SAVE}}", t.confirmSave);
   page.replace("{{CREDIT_PREFIX}}", t.creditPrefix);
-  page.replace("{{PREVIEW_REFRESH}}", t.previewRefresh);
   page.replace("{{MODE_OFF}}", t.modeOff);
   page.replace("{{HEADER_MODE_NOW}}", t.headerModeNow);
   page.replace("{{HEADER_MODE_RAIN}}", t.headerModeRain);
