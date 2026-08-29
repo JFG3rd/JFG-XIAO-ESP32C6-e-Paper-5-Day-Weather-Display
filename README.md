@@ -1,4 +1,4 @@
-# XIAO 2.9" BWRY E‑Paper Weather Display
+# JFG PaperCast
 
 Build a crisp, low‑power 4‑color (black/white/yellow/red) weather dashboard on the **[Seeed Studio XIAO ESP32‑C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/)** with the **2.9" 128×296 BWRY e‑paper panel** and the **[Seeed XIAO ePaper driver board](https://wiki.seeedstudio.com/xiao_eink_expansion_board_v2/)**.  
 This project focuses on a reliable, repeatable workflow: correct controller selection, correct pin mapping, and a proven render path.
@@ -52,7 +52,7 @@ After that, update over the air from the web UI — see [UserManual.md](UserManu
 
 On first boot, the device starts a captive portal:
 
-- Connect to **JFG-XIAO-Weather-Setup**
+- Connect to **JFG-PaperCast-Setup**
 - Your phone should open the setup page automatically
 - Select Wi‑Fi, enter password, and save
 
@@ -191,6 +191,10 @@ Because the model cannot detect charging, it needs an explicit zero point: press
 **"Battery charged"** in the web UI after every charge to reset it to 100 %. The relevant constants
 (`kBatteryCapacityMah`, `kEstimatedActiveMa`, `kEstimatedSleepUa`) live in
 [include/weather_config.h](include/weather_config.h).
+
+**Battery size** is chosen in the web UI rather than compiled in, so this firmware suits whatever
+cell you fit. It sets both the gauge's discharge profile (snapped to the nearest of the six the
+LC709203F supports) and the capacity the modelled estimate divides by.
 
 Fit an **Adafruit LC709203F** on the free D4/D5 pins and it takes over automatically, with real
 voltage and state‑of‑charge and no `?`. Wiring and bring‑up:

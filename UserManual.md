@@ -40,7 +40,7 @@ identical on the cards, which is why the `Rain in mm` header preset exists — i
 ## 2. First‑time setup
 
 1. Power the device. With no saved Wi‑Fi it starts its own access point,
-   **`JFG-XIAO-Weather-Setup`**.
+   **`JFG-PaperCast-Setup`**.
 2. Join that network from a phone or laptop. A setup page should open automatically (it answers the
    captive‑portal probes used by iOS, Android and Windows). If it does not, browse to
    **`http://192.168.4.1`**.
@@ -78,8 +78,8 @@ own framebuffer. It is a real screenshot, not a re‑drawing, so what you see is
 Press **Reload preview** after a change; the panel only updates when the device redraws it.
 
 ### Settings
-Location, time zone, layout, the two header lines, warnings, units, quiet hours and the low‑battery
-threshold. Press **Save** to apply them together. The form is filled from the device when the page
+Location, time zone, layout, the two header lines, warnings, units, **battery size**, quiet hours and
+the low‑battery threshold. Press **Save** to apply them together. The form is filled from the device when the page
 loads and then left alone, so it will not overwrite something you are part‑way through changing.
 
 ### Firmware Update
@@ -154,6 +154,15 @@ keeps working — less often — instead of dying sooner.
 **Keep awake (debug)** holds the device up for 15, 30 or 60 minutes, then expires on its own. Use
 this rather than switching deep sleep off, which stays off until you remember it.
 
+### Battery size
+
+Set **Battery size** in Settings to your cell's actual capacity. It does two jobs: it tells the
+LC709203F which discharge profile to use, and it is the capacity the modelled estimate divides by.
+
+The gauge itself only supports six profiles (100, 200, 500, 1000, 2000 and 3000 mAh), so the firmware
+picks the nearest one to whatever you choose — enter 400 for a 400 mAh cell and the gauge gets the
+500 mAh profile while the estimate still uses 400. Changing it applies immediately; no reboot.
+
 ### Measured versus estimated charge
 
 With an **LC709203F** fuel gauge fitted (see [docs/wire-diagram.md](docs/wire-diagram.md)) the
@@ -171,7 +180,7 @@ that press the estimate drifts further from reality with every cycle.
 ### Over the air (normal)
 
 1. **Get a `.bin`** — either download `firmware-vX.Y.Z.bin` from the
-   [Releases page](https://github.com/JFG3rd/JFG-XIAO-ESP32C6-e-Paper-5-Day-Weather-Display/releases),
+   [Releases page](https://github.com/JFG3rd/JFG-PaperCast/releases),
    or build one yourself:
 
    ```bash
@@ -257,6 +266,7 @@ Useful for scripting or debugging.
 | POST | `/warningSource` | `{source}` — `off` / `derived` / `dwd` |
 | POST | `/refreshInterval` | `{minutes}` |
 | POST | `/powerOptions` | Quiet hours and low‑battery settings |
+| POST | `/batteryPack` | `{mah}` — battery capacity |
 | POST | `/keepAwake` | `{minutes}` — 0 cancels |
 | POST | `/sleepMode` | `{enabled}` — deep sleep on/off |
 | POST | `/batteryFull` | Reset the modelled charge estimate to 100 % |

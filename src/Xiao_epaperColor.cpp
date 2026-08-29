@@ -96,8 +96,8 @@ constexpr uint8_t kWifiConnectAttempts = 2;
 constexpr uint8_t kMaxReconnectFailuresBeforeAp = 3;
 constexpr byte kDnsPort = 53;
 constexpr const char* kPrefsNamespace = "wifi";
-constexpr const char* kApSsid = "JFG-XIAO-Weather-Setup";
-constexpr const char* kStaHostname = "jfg-xiao-weather";
+constexpr const char* kApSsid = "JFG-PaperCast-Setup";
+constexpr const char* kStaHostname = "jfg-papercast";
 
 Preferences preferences;
 DNSServer dnsServer;
@@ -145,6 +145,9 @@ bool usbHostConnected = false;
 bool batteryCharging = false;
 // Minutes between forecast refreshes, set from the web UI and persisted in NVS.
 uint16_t refreshIntervalMinutes = kDefaultRefreshMinutes;
+// Battery pack capacity in mAh, chosen in the web UI so this firmware is not tied
+// to one builder's cell. Drives both the gauge's profile and the modelled estimate.
+uint16_t batteryPackMah = weather_config::kBatteryCapacityMah;
 // Location and timezone, all web-configurable and NVS-backed. Defaults come from
 // weather_config.h so a fresh device behaves exactly as before.
 float currentLatitude = weather_config::kDefaultLatitude;
@@ -422,6 +425,7 @@ struct UiText
   const char* quietFromLabel;
   const char* quietToLabel;
   const char* batteryWarnLabel;
+  const char* batteryPackLabel;
   const char* saveButton;
   const char* otaTitle;
   const char* otaHint;
@@ -437,7 +441,7 @@ const UiText kUiText[] = {
     {
         "en",
         "English",
-        "JFG-XIAO Weather Control",
+        "JFG PaperCast",
         "Status",
         "Wi-Fi Setup",
         "Logs",
@@ -527,6 +531,7 @@ const UiText kUiText[] = {
         "From",
         "To",
         "Warn and conserve below",
+        "Battery size",
         "Save",
         "Firmware Update",
         "Upload a firmware .bin built for this board. The device reboots when it verifies.",
@@ -541,7 +546,7 @@ const UiText kUiText[] = {
     {
         "de",
         "Deutsch",
-        "JFG-XIAO Wetter",
+        "JFG PaperCast",
         "Status",
         "WLAN Setup",
         "Logs",
@@ -570,7 +575,7 @@ const UiText kUiText[] = {
         "Nicht geladen",
         "Aktualisiert",
         "WLAN",
-        "JFG-XIAO Wetter Setup",
+        "JFG PaperCast Setup",
         "Verbinde das Display mit deinem WLAN. Diese Seite ist fuer Apple Captive Portal optimiert.",
         "Sichtbare Netzwerke",
         "Versteckte oder manuelle SSID",
@@ -631,6 +636,7 @@ const UiText kUiText[] = {
         "Von",
         "Bis",
         "Warnen und sparen unter",
+        "Batteriegroesse",
         "Speichern",
         "Firmware-Update",
         "Firmware .bin fuer dieses Board hochladen. Das Geraet startet nach der Pruefung neu.",
@@ -674,7 +680,7 @@ const UiText kUiText[] = {
         "No cargado",
         "Actualizado",
         "WiFi",
-        "JFG-XIAO Weather Setup",
+        "JFG PaperCast Setup",
         "Conecta la pantalla a tu Wi-Fi. Esta pagina esta optimizada para Apple captive portal.",
         "Redes visibles",
         "SSID oculta o manual",
@@ -735,6 +741,7 @@ const UiText kUiText[] = {
         "Desde",
         "Hasta",
         "Avisar y ahorrar por debajo de",
+        "Tamano de bateria",
         "Guardar",
         "Actualizacion de firmware",
         "Suba un .bin compilado para esta placa. El dispositivo se reinicia al verificarlo.",
@@ -778,7 +785,7 @@ const UiText kUiText[] = {
         "Non charge",
         "Mis a jour",
         "WiFi",
-        "JFG-XIAO Weather Setup",
+        "JFG PaperCast Setup",
         "Connectez l'ecran a votre Wi-Fi. Page optimisee pour le captive portal Apple.",
         "Reseaux visibles",
         "SSID masque ou manuel",
@@ -839,6 +846,7 @@ const UiText kUiText[] = {
         "De",
         "A",
         "Alerter et economiser sous",
+        "Taille de la batterie",
         "Enregistrer",
         "Mise a jour du firmware",
         "Televersez un .bin compile pour cette carte. Lappareil redemarre apres verification.",
@@ -1912,26 +1920,34 @@ void setupPanel(bool coldBoot)
 #endif
 }
 
-// Translate the configured pack capacity into the gauge's APA profile constant.
-// The LC709203F only accepts these fixed sizes; anything else is a config error.
+// Map a real pack capacity onto the gauge's APA profile. The LC709203F only
+// offers these six steps, so pick the nearest rather than rejecting anything that
+// is not an exact match - a maker with a 400 mAh cell should be able to enter 400
+// and get the closest profile, not a silent fallback to 1000.
 lc709203_adjustment_t batteryPackProfile(uint16_t packMah)
 {
-  switch (packMah) {
-    case 100:
-      return LC709203F_APA_100MAH;
-    case 200:
-      return LC709203F_APA_200MAH;
-    case 500:
-      return LC709203F_APA_500MAH;
-    case 1000:
-      return LC709203F_APA_1000MAH;
-    case 2000:
-      return LC709203F_APA_2000MAH;
-    case 3000:
-      return LC709203F_APA_3000MAH;
-    default:
-      return LC709203F_APA_1000MAH;
+  struct Step
+  {
+    uint16_t mah;
+    lc709203_adjustment_t apa;
+  };
+  static const Step kSteps[] = {
+      {100, LC709203F_APA_100MAH},   {200, LC709203F_APA_200MAH},
+      {500, LC709203F_APA_500MAH},   {1000, LC709203F_APA_1000MAH},
+      {2000, LC709203F_APA_2000MAH}, {3000, LC709203F_APA_3000MAH},
+  };
+  constexpr uint8_t kStepCount = sizeof(kSteps) / sizeof(kSteps[0]);
+
+  uint8_t best = 0;
+  uint32_t bestDistance = UINT32_MAX;
+  for (uint8_t i = 0; i < kStepCount; ++i) {
+    const uint32_t distance = (packMah > kSteps[i].mah) ? (packMah - kSteps[i].mah) : (kSteps[i].mah - packMah);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = i;
+    }
   }
+  return kSteps[best].apa;
 }
 
 // Bring up the LC709203F on the free D4/D5 I2C pins. Called once per wake cycle
@@ -1951,7 +1967,7 @@ void setupBatteryGauge(bool coldBoot)
     return;
   }
 
-  batteryGauge.setPackSize(batteryPackProfile(weather_config::kBatteryPackMah));
+  batteryGauge.setPackSize(batteryPackProfile(batteryPackMah));
   if (weather_config::kBatteryThermistorB > 0) {
     batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_THERMISTOR);
     batteryGauge.setThermistorB(weather_config::kBatteryThermistorB);
@@ -2033,7 +2049,7 @@ void resetConsumedCharge()
 // the last "battery charged" reset.
 uint8_t estimatedBatteryPercent()
 {
-  const uint32_t capacityUah = static_cast<uint32_t>(weather_config::kBatteryCapacityMah) * 1000UL;
+  const uint32_t capacityUah = static_cast<uint32_t>(batteryPackMah) * 1000UL;
   if (consumedUah >= capacityUah) {
     return 0;
   }
@@ -2206,9 +2222,9 @@ void renderHeader(const ForecastData& forecast)
 {
   const uint16_t displayWidth = epaper.width();
   epaper.fillRect(0, 0, displayWidth, kHeaderHeight, TFT_BLACK);
-  // Yellow, matching the card dividers and header text rather than competing with
-  // the red temperatures below. Sits flush on the cards: there is no gap now.
-  epaper.drawFastHLine(0, kHeaderHeight - 1, displayWidth, TFT_YELLOW);
+  // No rule under the banner. The black band against the white cards already
+  // separates them, and removing it frees the bottom rows so a large temperature
+  // can use the full banner height without painting over a line.
   // Left side, per the selected layout. Only this element and the resulting
   // clamp width differ between layouts; the right-hand column is identical in
   // all four. "temp" and "both" fall back to the city name when there is no
@@ -2711,6 +2727,46 @@ void noteCurrentIpAddress()
   preferences.end();
 }
 
+// Capacities offered in the web UI. Deliberately more values than the gauge's six
+// APA steps: makers should enter what their cell actually is, and the nearest
+// profile is derived from it.
+constexpr uint16_t kBatteryPackOptions[] = {100, 150, 200, 300, 400, 500, 600, 800,
+                                            1000, 1200, 1500, 2000, 2500, 3000};
+
+bool isBatteryPackSupported(uint16_t mah)
+{
+  for (uint8_t i = 0; i < (sizeof(kBatteryPackOptions) / sizeof(kBatteryPackOptions[0])); ++i) {
+    if (kBatteryPackOptions[i] == mah) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void loadBatteryPackPreference()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading battery size. Using default.");
+    return;
+  }
+  const uint16_t stored = preferences.getUShort("pack_mah", weather_config::kBatteryCapacityMah);
+  preferences.end();
+  if (isBatteryPackSupported(stored)) {
+    batteryPackMah = stored;
+  }
+}
+
+void saveBatteryPackPreference(uint16_t mah)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving battery size.");
+    return;
+  }
+  preferences.putUShort("pack_mah", mah);
+  preferences.end();
+  batteryPackMah = mah;
+}
+
 uint32_t refreshIntervalMs()
 {
   return static_cast<uint32_t>(refreshIntervalMinutes) * 60UL * 1000UL;
@@ -2811,6 +2867,24 @@ void noteWebActivity()
 }
 
 // <option> list for the refresh-interval selector, marking the active value.
+String buildBatteryPackOptions()
+{
+  String options;
+  for (uint8_t i = 0; i < (sizeof(kBatteryPackOptions) / sizeof(kBatteryPackOptions[0])); ++i) {
+    const uint16_t mah = kBatteryPackOptions[i];
+    options += "<option value='";
+    options += String(mah);
+    options += "'";
+    if (mah == batteryPackMah) {
+      options += " selected";
+    }
+    options += ">";
+    options += String(mah);
+    options += " mAh</option>";
+  }
+  return options;
+}
+
 String buildTimezoneOptions()
 {
   String options;
@@ -3379,6 +3453,8 @@ String buildStatusJson()
   json += batteryWarnEnabled ? "true" : "false";
   json += ",\"batteryWarnPercent\":";
   json += String(batteryWarnPercent);
+  json += ",\"batteryPackMah\":";
+  json += String(batteryPackMah);
   json += ",\"batteryLow\":";
   json += batteryIsLow() ? "true" : "false";
   json += ",\"warningSource\":\"";
@@ -3821,6 +3897,8 @@ String buildMainPage()
       <input type="number" id="quietStart" min="0" max="23">
       <label for="quietEnd">{{QUIET_TO_LABEL}}</label>
       <input type="number" id="quietEnd" min="0" max="23">
+      <label for="batteryPack">{{BATTERY_PACK_LABEL}}</label>
+      <select id="batteryPack">{{BATTERY_PACK_OPTIONS}}</select>
       <div class="sleep-row">
         <span>{{BATTERY_WARN_LABEL}}</span>
         <label class="switch"><input type="checkbox" id="batteryWarnEnabled"><span class="slider"></span></label>
@@ -3967,6 +4045,7 @@ String buildMainPage()
       setIfIdle('layout', status.layout);
       setIfIdle('headerMode', status.headerMode);
       setIfIdle('headerMode2', status.headerMode2);
+      setIfIdle('batteryPack', status.batteryPackMah);
       setIfIdle('warningSource', status.warningSource);
       settingsLoaded = true;
       const ka = document.getElementById('keepAwakeState');
@@ -4105,6 +4184,10 @@ String buildMainPage()
           mode2: document.getElementById('headerMode2').value
         })
       });
+      await fetch('/batteryPack', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mah: parseInt(document.getElementById('batteryPack').value, 10)})
+      });
       await fetch('/warningSource', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({source: document.getElementById('warningSource').value})
@@ -4207,6 +4290,8 @@ String buildMainPage()
   page.replace("{{QUIET_FROM_LABEL}}", t.quietFromLabel);
   page.replace("{{QUIET_TO_LABEL}}", t.quietToLabel);
   page.replace("{{BATTERY_WARN_LABEL}}", t.batteryWarnLabel);
+  page.replace("{{BATTERY_PACK_LABEL}}", t.batteryPackLabel);
+  page.replace("{{BATTERY_PACK_OPTIONS}}", buildBatteryPackOptions());
   page.replace("{{SAVE_BUTTON}}", t.saveButton);
   page.replace("{{TIMEZONE_OPTIONS}}", buildTimezoneOptions());
   page.replace("{{OTA_TITLE}}", t.otaTitle);
@@ -4935,6 +5020,29 @@ void handleHeaderMode()
   requestRefresh();
 }
 
+void handleBatteryPack()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const uint16_t mah = doc["mah"] | 0;
+  if (!isBatteryPackSupported(mah)) {
+    server.send(400, "text/plain", "Unsupported battery size");
+    return;
+  }
+
+  saveBatteryPackPreference(mah);
+  // Apply to the gauge immediately; no reboot needed to change its profile.
+  if (batteryGaugeReady) {
+    batteryGauge.setPackSize(batteryPackProfile(batteryPackMah));
+  }
+  addLog(String("Battery pack set to ") + batteryPackMah + " mAh.");
+  server.send(200, "text/plain", String("Battery size set to ") + batteryPackMah + " mAh.");
+}
+
 void handleLayout()
 {
   noteWebActivity();
@@ -5129,6 +5237,7 @@ void setupWebServer()
   server.on("/warningSource", HTTP_POST, handleWarningSource);
   server.on("/headerMode", HTTP_POST, handleHeaderMode);
   server.on("/layout", HTTP_POST, handleLayout);
+  server.on("/batteryPack", HTTP_POST, handleBatteryPack);
   server.on("/keepAwake", HTTP_POST, handleKeepAwake);
   server.on("/panel.bmp", HTTP_GET, handlePanelBitmap);
   server.on("/batteryFull", HTTP_POST, handleBatteryFull);
@@ -5188,6 +5297,7 @@ void setupRuntime()
   loadPowerPreferences();
   loadWarningPreference();
   loadHeaderPreference();
+  loadBatteryPackPreference();
   loadConsumedCharge();
   loadStaticIpConfig();
   setupWebServer();
@@ -5231,7 +5341,7 @@ void setup()
 
   if (coldBoot) {
     rtcWakeCount = 0;
-    addLog("XIAO weather app booting.");
+    addLog("JFG PaperCast booting.");
   } else {
     ++rtcWakeCount;
     addLog(String("Woke from deep sleep (cycle ") + rtcWakeCount + ").");
