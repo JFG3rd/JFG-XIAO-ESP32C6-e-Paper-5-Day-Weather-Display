@@ -109,6 +109,43 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 - Battery indicator with the charge percentage inside it, and a red strip when it runs low
 - Auto refresh on a configurable interval (default 60 minutes), deep sleeping in between
 
+### Display layouts
+
+The banner is built from three independent choices: what sits on the **left**, and what each of the
+two **information lines** shows. Any layout combines with any pair of presets.
+
+**Layout — the left of the banner:**
+
+| Layout | Left element |
+|---|---|
+| `Temperature` | The current temperature, large (18 pt) with a degree ring |
+| `Location` | The city name |
+| `Temperature + location` | The temperature (12 pt) with the city name beneath it |
+| `Info only` | Nothing — the full width goes to the information lines |
+
+Temperature layouts fall back to the city name until the first reading arrives.
+
+**Presets — what each information line renders:**
+
+| Preset | Example | Shows |
+|---|---|---|
+| Feels‑like + UV | `Gefuehlt 19 UV 5` | Apparent temperature and UV index |
+| Rain in mm | `Regen 2.4mm 60%` | Rainfall **amount** plus probability |
+| Sunrise / sunset | `Sonne 06:12-20:02` | |
+| Wind + gusts | `Wind 12 Boe 24` | Wind is shown nowhere else |
+| Off *(second line only)* | | Leaves the line blank |
+
+**Worked examples** — the same weather, three different configurations:
+
+| Layout | Line 1 | Line 2 | Banner |
+|---|---|---|---|
+| Temperature | Feels‑like + UV | Sunrise/sunset | `26°` · `Gefuehlt 24 UV 5` / `Sonne 06:12-20:02` / `Updated: SAT 29/08 16:48` |
+| Location | Rain in mm | Off | `Berlin` · `Regen 0mm 35%` / *(blank)* / `Updated: …` |
+| Info only | Wind + gusts | Rain in mm | *(no left)* · `Wind 12 Boe 24` / `Regen 0mm 35%` / `Updated: …` |
+
+The third line is always the update time. **Line 1 is not always your preset** — it yields to a
+weather warning when one is active, and to the IP address after a cold boot or an address change.
+
 ---
 
 ## Web UI Features
@@ -319,6 +356,16 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 - Using partial refresh without validation
 
 ---
+
+## Credits
+
+- **Forecasts: [Open-Meteo.com](https://open-meteo.com/)**, used under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Open-Meteo asks for a credit with a link
+  next to anywhere their data is displayed, which is why the web UI carries one in its footer.
+- **Weather warnings (optional source): Deutscher Wetterdienst**, retrieved through
+  [Bright Sky](https://brightsky.dev/). DWD's terms of use govern that data.
+- **Graphics: [Seeed_GFX](https://github.com/Seeed-Studio/Seeed_Arduino_LCD)**, a TFT_eSPI fork,
+  vendored in `lib/Seeed_GFX`.
 
 ## License
 

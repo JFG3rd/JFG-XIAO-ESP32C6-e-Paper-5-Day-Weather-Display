@@ -73,9 +73,19 @@ Change networks, enter a hidden SSID, or configure a static IP. **Forget Wi‑Fi
 credentials and returns the device to its setup access point.
 
 ### Panel preview
-A picture of what is actually on the e‑paper right now, fetched from the device as an image of its
-own framebuffer. It is a real screenshot, not a re‑drawing, so what you see is what the panel shows.
-Press **Reload preview** after a change; the panel only updates when the device redraws it.
+A picture of what is actually on the e‑paper, fetched from the device as an image of its own
+framebuffer. It is a real screenshot, not a re‑drawing, so what you see is what the panel shows.
+
+It also **previews unsaved changes**: change the layout, either header line, or the location name and
+the preview redraws immediately with those values. Nothing is applied until you press **Save**, and
+the preview says so while it is showing something unsaved. This costs the device nothing and never
+touches the display — it draws into memory and hands back the picture.
+
+Two things it does not preview: **units**, because °C/°F conversion happens at the weather service and
+would need a fresh forecast rather than a redraw; and the **network line**, which is suppressed so you
+can see the preset you are choosing rather than the IP address.
+
+Press **Reload preview** to go back to what is physically on the panel.
 
 ### Settings
 Location, time zone, layout, the two header lines, warnings, units, **battery size**, quiet hours and
@@ -254,6 +264,7 @@ Useful for scripting or debugging.
 | GET | `/status` | Full device state as JSON |
 | GET | `/logs` | Recent log lines as JSON |
 | GET | `/panel.bmp` | The panel's framebuffer as an image |
+| GET | `/preview.bmp` | Render proposed settings without saving: `?layout=&mode=&mode2=&label=` |
 | GET | `/panelProbe` | Re‑test the panel; reports the BUSY line state |
 | GET | `/scan` | Wi‑Fi scan results |
 | POST | `/update` | Upload firmware (multipart) |
@@ -274,3 +285,14 @@ Useful for scripting or debugging.
 | POST | `/saveWiFi` | Credentials and static IP |
 | POST | `/forgetWiFi` | Clear credentials and reboot to setup |
 | POST | `/reboot` | Restart |
+
+---
+
+## 9. Credits
+
+Forecasts come from **[Open-Meteo.com](https://open-meteo.com/)** under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); the credit in the web UI footer is there
+because their licence asks for one next to where the data is shown.
+
+Official weather warnings, when that source is selected, come from the **Deutscher Wetterdienst** via
+**[Bright Sky](https://brightsky.dev/)**, and DWD's terms of use apply to them.

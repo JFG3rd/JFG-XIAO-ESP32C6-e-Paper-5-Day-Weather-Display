@@ -399,6 +399,9 @@ struct UiText
   const char* layoutBoth;
   const char* layoutInfo;
   const char* previewTitle;
+  const char* previewUnsaved;
+  const char* confirmSave;
+  const char* creditPrefix;
   const char* previewRefresh;
   const char* modeOff;
   const char* headerModeNow;
@@ -505,6 +508,9 @@ const UiText kUiText[] = {
         "Temperature + location",
         "Info only",
         "Panel preview",
+        "Preview of unsaved settings - press Save to apply",
+        "Do you want to change the settings?",
+        "Weather data by",
         "Reload preview",
         "Off",
         "Feels-like + UV",
@@ -610,6 +616,9 @@ const UiText kUiText[] = {
         "Temperatur + Ort",
         "Nur Infos",
         "Anzeigevorschau",
+        "Vorschau nicht gespeicherter Einstellungen - Speichern zum Uebernehmen",
+        "Moechten Sie die Einstellungen aendern?",
+        "Wetterdaten von",
         "Vorschau neu laden",
         "Aus",
         "Gefuehlt + UV",
@@ -715,6 +724,9 @@ const UiText kUiText[] = {
         "Temperatura + lugar",
         "Solo info",
         "Vista del panel",
+        "Vista previa sin guardar - pulse Guardar para aplicar",
+        "Desea cambiar los ajustes?",
+        "Datos meteorologicos de",
         "Recargar vista",
         "Desactivado",
         "Sensacion + UV",
@@ -820,6 +832,9 @@ const UiText kUiText[] = {
         "Temperature + lieu",
         "Infos seules",
         "Apercu du panneau",
+        "Apercu non enregistre - appuyez sur Enregistrer",
+        "Voulez-vous modifier les parametres?",
+        "Donnees meteo de",
         "Recharger lapercu",
         "Desactive",
         "Ressenti + UV",
@@ -2366,11 +2381,17 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
 }
 
 // Full-screen forecast render. This redraws the full frame (not partial refresh).
-void renderForecast(const ForecastData& forecast)
+// Draw the whole frame into the sprite without pushing it to the panel.
+//
+// This split is what makes a live preview possible: everything here is RAM work
+// and takes milliseconds, while panelUpdate() below spends ~19 s clocking the
+// buffer out to the e-paper. A preview renders with proposed settings, reads the
+// buffer back out as an image, and never touches the display.
+//
+// Deliberately not gated on panelReady - the sprite works whether or not the
+// panel does, so previews still function on a device with a dead display.
+void drawForecastToBuffer(const ForecastData& forecast)
 {
-  if (!panelReady) {
-    return;
-  }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
   const uint16_t displayWidth = epaper.width();
@@ -2391,6 +2412,14 @@ void renderForecast(const ForecastData& forecast)
     renderDayCard(forecast.days[i], cardX, usableTop, cardWidth, cardHeight);
     renderFooterMetrics(forecast.days[i], cardX, usableTop + cardHeight - 12, cardWidth);
   }
+}
+
+void renderForecast(const ForecastData& forecast)
+{
+  if (!panelReady) {
+    return;
+  }
+  drawForecastToBuffer(forecast);
   panelUpdate("forecast");
 }
 
@@ -3725,6 +3754,11 @@ String buildMainPage()
       image-rendering: pixelated;
       max-width: none;
     }
+    .credits {
+      max-width: 1900px; margin: 0 auto 24px; padding: 0 20px;
+      font-size: 12px; opacity: 0.75; text-align: center; color: var(--info-text);
+    }
+    .credits a { color: inherit; }
     .sleep-hint { font-size: 11px; opacity: 0.75; margin-top: 4px; color: var(--info-text); }
     label { display: block; margin: 10px 0 4px; font-size: 14px; color: var(--label-text); }
     select, input, textarea {
@@ -3834,15 +3868,6 @@ String buildMainPage()
       </div>
     </div>
     <div class="card">
-      <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
-      <!-- The framebuffer is the panel's native portrait 128x296; rotating here
-           avoids second-guessing the sprite's coordinate mapping on the device. -->
-      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="panel"></div>
-      <div class="button-row" style="grid-template-columns:1fr">
-        <button class="btn-nav" onclick="reloadPanel()">{{PREVIEW_REFRESH}}</button>
-      </div>
-    </div>
-    <div class="card">
       <h2 class="card-title">{{SETTINGS_TITLE}}</h2>
       <label for="locLabel">{{LOCATION_LABEL}}</label>
       <input type="text" id="locLabel" maxlength="24">
@@ -3907,6 +3932,7 @@ String buildMainPage()
       <div class="button-row" style="grid-template-columns:1fr">
         <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
       </div>
+      <div id="saveNote" class="sleep-hint"></div>
       <label>{{KEEP_AWAKE_LABEL}}</label>
       <div class="button-row" style="grid-template-columns:repeat(4,1fr)">
         <button class="btn-nav" onclick="keepAwake(15)">15m</button>
@@ -3915,6 +3941,16 @@ String buildMainPage()
         <button class="btn-nav" onclick="keepAwake(0)">off</button>
       </div>
       <div id="keepAwakeState" class="sleep-hint"></div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
+      <!-- The framebuffer is the panel's native portrait 128x296; rotating here
+           avoids second-guessing the sprite's coordinate mapping on the device. -->
+      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="panel"></div>
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-nav" onclick="reloadPanel()">{{PREVIEW_REFRESH}}</button>
+      </div>
+      <div id="previewNote" class="sleep-hint"></div>
     </div>
     <div class="card">
       <h2 class="card-title">{{OTA_TITLE}}</h2>
@@ -3932,6 +3968,14 @@ String buildMainPage()
       </div>
     </div>
   </div>
+  <!-- Open-Meteo publish under CC BY 4.0 and ask for a credit with a link next to
+       where their data is shown. The panel itself cannot carry a link, so the
+       credit lives here and in the documentation. -->
+  <footer class="credits">
+    {{CREDIT_PREFIX}} <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a>
+    (<a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>)
+    <span id="dwdCredit"></span>
+  </footer>
   <script>
     const ui = {
       summaryAp: '{{SUMMARY_AP}}',
@@ -3951,7 +3995,9 @@ String buildMainPage()
       statusBattery: '{{STATUS_BATTERY}}',
       statusSleepIn: '{{STATUS_SLEEP_IN}}',
       batteryUnknown: '{{BATTERY_UNKNOWN}}',
-      batteryEstimatedNote: '{{BATTERY_ESTIMATED_NOTE}}'
+      batteryEstimatedNote: '{{BATTERY_ESTIMATED_NOTE}}',
+      confirmSave: '{{CONFIRM_SAVE}}',
+      previewUnsaved: '{{PREVIEW_UNSAVED}}'
     };
     let currentConnectedSsid = '';
     // Settings inputs are filled from the device only until the first fill
@@ -4047,6 +4093,12 @@ String buildMainPage()
       setIfIdle('headerMode2', status.headerMode2);
       setIfIdle('batteryPack', status.batteryPackMah);
       setIfIdle('warningSource', status.warningSource);
+      const dwd = document.getElementById('dwdCredit');
+      if (dwd) {
+        dwd.innerHTML = status.warningSource === 'dwd'
+          ? ' &middot; Warnings: Deutscher Wetterdienst via <a href="https://brightsky.dev/" target="_blank" rel="noopener">Bright Sky</a>'
+          : '';
+      }
       settingsLoaded = true;
       const ka = document.getElementById('keepAwakeState');
       if (ka) {
@@ -4153,6 +4205,7 @@ String buildMainPage()
       await updateStatus();
     }
     async function saveSettings() {
+      if (!confirm(ui.confirmSave)) { return; }
       const label = document.getElementById('locLabel').value.trim();
       const latitude = parseFloat(document.getElementById('lat').value);
       const longitude = parseFloat(document.getElementById('lon').value);
@@ -4202,16 +4255,39 @@ String buildMainPage()
           batteryWarnPercent: parseInt(document.getElementById('batteryWarnPercent').value, 10)
         })
       });
-      alert(await r.text());
+      // Inline rather than a second popup: the confirmation already interrupted.
+      const note = document.getElementById('saveNote');
+      if (note) { note.textContent = await r.text(); }
       // Re-sync from the device so the form shows what was actually stored - if a
       // value was rejected, this is what makes that visible instead of silent.
       settingsLoaded = false;
       await updateStatus();
+      // The preview now matches what is stored, so show the real panel again.
+      const pnote = document.getElementById('previewNote');
+      if (pnote) { pnote.textContent = ''; }
     }
     function reloadPanel() {
       // Cache-bust: the panel only changes on a render, but the browser cannot know that.
       document.getElementById('panelImg').src = '/panel.bmp?t=' + Date.now();
     }
+    // Render the form's current values without saving them. The device draws into
+    // its buffer and hands back an image; the display itself is never touched.
+    function previewSettings() {
+      const q = new URLSearchParams({
+        layout: document.getElementById('layout').value,
+        mode: document.getElementById('headerMode').value,
+        mode2: document.getElementById('headerMode2').value,
+        label: document.getElementById('locLabel').value.trim(),
+        t: Date.now()
+      });
+      document.getElementById('panelImg').src = '/preview.bmp?' + q.toString();
+      const note = document.getElementById('previewNote');
+      if (note) { note.textContent = ui.previewUnsaved; }
+    }
+    ['layout', 'headerMode', 'headerMode2'].forEach(id => {
+      document.getElementById(id).addEventListener('change', previewSettings);
+    });
+    document.getElementById('locLabel').addEventListener('change', previewSettings);
     async function keepAwake(minutes) {
       const r = await fetch('/keepAwake', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -4271,6 +4347,9 @@ String buildMainPage()
   page.replace("{{LAYOUT_BOTH}}", t.layoutBoth);
   page.replace("{{LAYOUT_INFO}}", t.layoutInfo);
   page.replace("{{PREVIEW_TITLE}}", t.previewTitle);
+  page.replace("{{PREVIEW_UNSAVED}}", t.previewUnsaved);
+  page.replace("{{CONFIRM_SAVE}}", t.confirmSave);
+  page.replace("{{CREDIT_PREFIX}}", t.creditPrefix);
   page.replace("{{PREVIEW_REFRESH}}", t.previewRefresh);
   page.replace("{{MODE_OFF}}", t.modeOff);
   page.replace("{{HEADER_MODE_NOW}}", t.headerModeNow);
@@ -5075,9 +5154,10 @@ void handleLayout()
 // of the rotation used for drawing, so the image is emitted portrait and the web
 // page rotates it. Doing the rotation here would mean second-guessing the
 // sprite's internal coordinate mapping for no benefit.
-void handlePanelBitmap()
+// Emit whatever is currently in the sprite as a 4-bit BMP. Shared by the live
+// panel image and the settings preview.
+void sendPanelBitmap()
 {
-  noteWebActivity();
 #ifdef EPAPER_ENABLE
   constexpr int32_t kBmpWidth = TFT_WIDTH;    // 128
   constexpr int32_t kBmpHeight = TFT_HEIGHT;  // 296
@@ -5125,6 +5205,65 @@ void handlePanelBitmap()
   server.send(200, "image/bmp", "");
   server.sendContent(reinterpret_cast<const char*>(header), sizeof(header));
   server.sendContent(reinterpret_cast<const char*>(epaper.getPointer()), kPixelBytes);
+#else
+  server.send(404, "text/plain", "No panel");
+#endif
+}
+
+void handlePanelBitmap()
+{
+  noteWebActivity();
+  sendPanelBitmap();
+}
+
+// Render the frame with proposed settings and return it as an image, without
+// saving anything and without touching the panel.
+//
+// Only the drawing runs - never panelUpdate() - so this costs milliseconds and
+// the display is left exactly as it was. The sprite is redrawn with the real
+// settings afterwards so /panel.bmp keeps matching the physical panel.
+void handlePreviewBitmap()
+{
+  noteWebActivity();
+#ifdef EPAPER_ENABLE
+  const String savedLayout = headerLayout;
+  const String savedMode = headerMode;
+  const String savedMode2 = headerMode2;
+  const String savedLabel = currentLocationLabel;
+  const bool savedShowNetwork = showNetworkInfo;
+
+  // Unrecognised values fall back to what is stored rather than erroring: a
+  // preview should always render something.
+  if (server.hasArg("layout") && isHeaderLayoutSupported(server.arg("layout"))) {
+    headerLayout = server.arg("layout");
+  }
+  if (server.hasArg("mode") && isHeaderModeSupported(server.arg("mode"))) {
+    headerMode = server.arg("mode");
+  }
+  if (server.hasArg("mode2") && isHeaderMode2Supported(server.arg("mode2"))) {
+    headerMode2 = server.arg("mode2");
+  }
+  if (server.hasArg("label")) {
+    String label = toDisplayAscii(server.arg("label"));
+    label.trim();
+    if (!label.isEmpty()) {
+      currentLocationLabel = label.substring(0, 24);
+    }
+  }
+  // Boot state, not a setting. Left true it would show the SSID line and hide the
+  // very preset being previewed.
+  showNetworkInfo = false;
+
+  drawForecastToBuffer(currentForecast);
+  sendPanelBitmap();
+
+  headerLayout = savedLayout;
+  headerMode = savedMode;
+  headerMode2 = savedMode2;
+  currentLocationLabel = savedLabel;
+  showNetworkInfo = savedShowNetwork;
+  // Put the buffer back so /panel.bmp still reflects the physical panel.
+  drawForecastToBuffer(currentForecast);
 #else
   server.send(404, "text/plain", "No panel");
 #endif
@@ -5240,6 +5379,7 @@ void setupWebServer()
   server.on("/batteryPack", HTTP_POST, handleBatteryPack);
   server.on("/keepAwake", HTTP_POST, handleKeepAwake);
   server.on("/panel.bmp", HTTP_GET, handlePanelBitmap);
+  server.on("/preview.bmp", HTTP_GET, handlePreviewBitmap);
   server.on("/batteryFull", HTTP_POST, handleBatteryFull);
   server.on("/panelProbe", HTTP_GET, handlePanelProbe);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
