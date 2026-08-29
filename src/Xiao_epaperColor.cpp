@@ -48,11 +48,11 @@ namespace
 constexpr uint8_t kForecastDays = 5;
 constexpr uint8_t kMaxLogEntries = 24;
 constexpr uint8_t kMaxScanEntries = 16;
-// 26 px, up from 22. The extra 4 px come from the dead margin that used to sit
-// below the cards (renderForecast subtracted 4 from cardHeight and drew nothing
-// there), so the cards keep their exact size and the panel finally uses all
-// 128 px. The banner needs the height for a third 8 px line on the right.
-constexpr uint16_t kHeaderHeight = 26;
+// 30 px. The banner absorbs both the dead margin that used to sit below the
+// cards and the 4 px white gap that used to sit between banner and cards, so the
+// rule now lands flush on the cards. cardHeight is unchanged at 98 px either way
+// (128 - 30), and the extra rows give the 25 px tall 18 pt digits room to breathe.
+constexpr uint16_t kHeaderHeight = 30;
 // Battery glyph drawn in the top-right of the header (body + terminal nub).
 constexpr uint16_t kBatteryIconWidth = 30;
 // Horizontal space reserved for the glyph, including the margin around it.
@@ -2206,7 +2206,9 @@ void renderHeader(const ForecastData& forecast)
 {
   const uint16_t displayWidth = epaper.width();
   epaper.fillRect(0, 0, displayWidth, kHeaderHeight, TFT_BLACK);
-  epaper.drawFastHLine(0, kHeaderHeight - 1, displayWidth, TFT_RED);
+  // Yellow, matching the card dividers and header text rather than competing with
+  // the red temperatures below. Sits flush on the cards: there is no gap now.
+  epaper.drawFastHLine(0, kHeaderHeight - 1, displayWidth, TFT_YELLOW);
   // Left side, per the selected layout. Only this element and the resulting
   // clamp width differ between layouts; the right-hand column is identical in
   // all four. "temp" and "both" fall back to the city name when there is no
@@ -2218,23 +2220,29 @@ void renderHeader(const ForecastData& forecast)
 
   if (wantTemperature) {
     const String tempText = String(forecast.currentTemp);
-    // The forecast-temperature font, so the number reads at the same weight as
-    // the figures in the cards below it.
-    drawFreeFontLeft(tempText, 4, 0, &FreeSansBold12pt7b, TFT_YELLOW, TFT_BLACK);
-    epaper.setFreeFont(&FreeSansBold12pt7b);
+    // "temp" gets the big font; "both" deliberately stays on the smaller one.
+    // An 18 pt digit is 25 px tall and lands on rows 1-25, which would run into
+    // the city name that "both" draws underneath. Measured from the font header,
+    // not guessed - do not "fix" this by making them consistent.
+    const bool bigFont = (headerLayout == "temp");
+    const GFXfont* font = bigFont ? &FreeSansBold18pt7b : &FreeSansBold12pt7b;
+    drawFreeFontLeft(tempText, 4, 0, font, TFT_YELLOW, TFT_BLACK);
+    epaper.setFreeFont(font);
     const uint16_t tempWidth = epaper.textWidth(tempText);
     epaper.setFreeFont(nullptr);
     // Free fonts carry no degree glyph; drawDegreeSymbol() draws the ring, which
-    // is only possible because the left column sits at a known x.
-    drawDegreeSymbol(4 + tempWidth + 4, 5, 2, TFT_YELLOW);
-    leftWidth = tempWidth + 10;
+    // is only possible because the left column sits at a known x. The ring scales
+    // with the digits so it does not look stranded next to the larger font.
+    drawDegreeSymbol(4 + tempWidth + (bigFont ? 5 : 4), bigFont ? 7 : 5, bigFont ? 3 : 2, TFT_YELLOW);
+    leftWidth = tempWidth + (bigFont ? 14 : 10);
   }
 
   if (wantLocation) {
     if (headerLayout == "both") {
       // Small, tucked under the temperature, clear of the red rule at the bottom.
       epaper.setTextColor(TFT_YELLOW, TFT_BLACK);
-      epaper.drawString(forecast.location, 4, 17, 1);
+      // Below the 12 pt digits (rows 1-18) and clear of the rule at y=29.
+      epaper.drawString(forecast.location, 4, 20, 1);
       leftWidth = max(leftWidth, static_cast<uint16_t>(epaper.textWidth(forecast.location, 1)));
     } else {
       drawFreeFontLeft(forecast.location, 4, 2, &FreeSansBold9pt7b, TFT_YELLOW, TFT_BLACK);
@@ -2354,7 +2362,8 @@ void renderForecast(const ForecastData& forecast)
   epaper.fillScreen(TFT_WHITE);
   renderHeader(forecast);
 
-  const uint16_t usableTop = kHeaderHeight + 4;
+  // No gap: the banner runs right down to the cards, and its rule is the divider.
+  const uint16_t usableTop = kHeaderHeight;
   // No bottom margin: those 4 px now belong to the taller banner, which keeps
   // cardHeight identical to before at 98 px.
   const uint16_t cardHeight = displayHeight - usableTop;
@@ -3572,13 +3581,21 @@ String buildMainPage()
     .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: var(--switch-thumb); transition: .3s; border-radius: 50%; }
     input:checked + .slider { background: var(--switch-on); }
     input:checked + .slider:before { transform: translateX(14px); }
+    /* Multi-column flow, not grid. Grid lays items out in rows and a row is as
+       tall as its tallest member, so the very tall Settings card pushed every
+       later card - Logs especially - below it however much width was free. Columns
+       let each card follow the one above it and spill into the next column, so
+       the cards pack. Reading order becomes column-major, which is normal for a
+       dashboard. */
     .dashboard {
-      display: flex; gap: 20px; flex-wrap: wrap;
-      justify-content: center; align-items: flex-start;
-      max-width: 1200px; margin: 20px auto; padding: 0 20px;
+      column-width: 340px; column-gap: 20px;
+      max-width: 1900px; margin: 20px auto; padding: 0 20px;
     }
     .card {
-      flex: 1; min-width: 300px; max-width: 420px;
+      /* Never split a card across a column boundary. */
+      break-inside: avoid; -webkit-column-break-inside: avoid;
+      display: inline-block; width: 100%; margin: 0 0 20px;
+      min-width: 0;
       background: var(--card-bg); color: var(--card-text);
       border-radius: 10px; padding: 16px;
       box-shadow: var(--card-shadow);
@@ -3663,14 +3680,13 @@ String buildMainPage()
       font-size: 12px; line-height: 1.5; font-family: monospace;
     }
     @media (max-width: 1000px) {
-      .dashboard { flex-direction: column; align-items: center; }
-      .card { width: 100%; max-width: 600px; }
+      /* Narrower columns so a mid-size window still gets two rather than one. */
+      .dashboard { column-width: 300px; }
     }
     @media (max-width: 600px) {
       body { padding: 0; }
       h1 { font-size: 1.3em; }
-      .dashboard { padding: 0 10px; }
-      .card { min-width: unset; }
+      .dashboard { padding: 0 10px; column-width: auto; column-count: 1; }
       .button-row { grid-template-columns: 1fr; }
     }
   </style>
@@ -3860,6 +3876,9 @@ String buildMainPage()
       batteryEstimatedNote: '{{BATTERY_ESTIMATED_NOTE}}'
     };
     let currentConnectedSsid = '';
+    // Settings inputs are filled from the device only until the first fill
+    // completes; after that they belong to the user until they save.
+    let settingsLoaded = false;
     // Dark mode
     (function() {
       const toggle = document.getElementById('darkToggle');
@@ -3929,11 +3948,15 @@ String buildMainPage()
         makeInfoItem(ui.statusUpdated, status.updated || '-') +
         makeInfoItem(ui.statusBattery, makeBatteryValue(status)) +
         makeInfoItem(ui.statusSleepIn, status.deepSleepEnabled ? `${status.awakeSecondsLeft}s` : '-');
-      // Fill the settings inputs from the device, but never fight a field the
-      // user is currently editing.
+      // Populate the settings inputs ONCE. The poll runs every 8 s, and checking
+      // only document.activeElement was not enough: as soon as focus left a
+      // dropdown the next poll overwrote the user's choice with the stored value,
+      // so Save then posted the old value back and the change appeared to be
+      // ignored. After a save, saveSettings() re-syncs deliberately.
       const setIfIdle = (id, value) => {
+        if (settingsLoaded) { return; }
         const el = document.getElementById(id);
-        if (el && document.activeElement !== el) {
+        if (el) {
           if (el.type === 'checkbox') { el.checked = !!value; } else { el.value = value; }
         }
       };
@@ -3945,6 +3968,7 @@ String buildMainPage()
       setIfIdle('headerMode', status.headerMode);
       setIfIdle('headerMode2', status.headerMode2);
       setIfIdle('warningSource', status.warningSource);
+      settingsLoaded = true;
       const ka = document.getElementById('keepAwakeState');
       if (ka) {
         ka.textContent = status.keepAwakeSecondsLeft > 0
@@ -4096,6 +4120,9 @@ String buildMainPage()
         })
       });
       alert(await r.text());
+      // Re-sync from the device so the form shows what was actually stored - if a
+      // value was rejected, this is what makes that visible instead of silent.
+      settingsLoaded = false;
       await updateStatus();
     }
     function reloadPanel() {

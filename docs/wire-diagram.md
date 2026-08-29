@@ -3,10 +3,10 @@
 Step-by-step integration of an **Adafruit LC709203F LiPoly / LiIon Fuel Gauge** (PID 4712) into the
 XIAO ESP32-C6 + ePaper Driver Board weather display.
 
-> **Status:** the gauge is **on order** for this project. The firmware already ships with
-> `kBatteryGaugeEnabled = true`; until the part arrives the device simply logs
-> `Battery gauge not found on I2C` once per wake and shows **?** / **No sensor** in the header and
-> the web UI. Nothing else changes — no reflash is needed when you plug it in.
+> **Status: fitted and working.** The gauge is wired per this document and reporting real values
+> (`batteryEstimated: false`, with voltage). If it is ever disconnected the firmware falls back to a
+> modelled estimate marked with a trailing **?**, logging `Battery gauge not found on I2C` once per
+> wake — no reflash is needed in either direction.
 
 ---
 
@@ -53,7 +53,7 @@ The breakout already carries 10 kΩ pull-ups on SDA and SCL, so no extra resisto
                                     (A) │              │ (B)
                                         │              │
                        LiPo ────────────┘              └──────────► driver board CN_BAT
-                     (1000 mAh)                                     (the board's BAT connector)
+                      (400 mAh)                                     (the board's BAT connector)
 ```
 
 `*` THERM is only used if your pack has a 10 kΩ NTC. Leave it open and keep

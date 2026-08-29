@@ -40,11 +40,19 @@ Install PlatformIO Core or use the PlatformIO IDE extension.
 platformio run -t upload -e seeed_xiao_esp32c6
 ```
 
+`esptool` cannot sync with this board, so the first flash goes over the chip's built‑in JTAG:
+
+```bash
+PLATFORMIO_UPLOAD_PROTOCOL=esp-builtin pio run -e seeed_xiao_esp32c6 -t upload
+```
+
+After that, update over the air from the web UI — see [UserManual.md](UserManual.md#6-firmware-updates).
+
 ### 3) First Boot Setup
 
 On first boot, the device starts a captive portal:
 
-- Connect to **XIAO-Weather-Setup**
+- Connect to **JFG-XIAO-Weather-Setup**
 - Your phone should open the setup page automatically
 - Select Wi‑Fi, enter password, and save
 
@@ -92,10 +100,14 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 
 - 5‑day forecast layout
 - Bold max temperature
-- Compact legend (L = low, P = precipitation)
+- Compact legend (L = low, P = precipitation **probability**)
 - Weather icons (40×40 sprites, 4bpp palette)
-- Battery symbol in the top‑right of the header, with the charge percentage overlaid
-- Auto refresh every 30 minutes, deep sleeping in between
+- **Four selectable header layouts**: large current temperature, city name, both, or neither
+- **Two configurable information lines** — feels‑like + UV, rain in mm, sunrise/sunset, or wind +
+  gusts. The first line yields to a weather warning, or to the IP address after a cold boot
+- **Weather warnings** — derived from the forecast, or official DWD warnings via Bright Sky
+- Battery indicator with the charge percentage inside it, and a red strip when it runs low
+- Auto refresh on a configurable interval (default 60 minutes), deep sleeping in between
 
 ---
 
@@ -103,14 +115,19 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 
 Open the control page at `http://<device-ip>/`:
 
-- Wi‑Fi setup
-- Rescan networks
-- Manual SSID
-- Static IP configuration
+- **Panel preview** — a live picture of the e‑paper's own framebuffer, so you can see the display
+  without looking at it
+- **Firmware update over the air** — upload a `.bin` from the browser; no cable
+- Wi‑Fi setup, rescan, manual SSID, static IP
+- **Location, time zone and units** (°C/°F, km/h / mph)
+- **Refresh interval** (15–240 min), **quiet hours**, low‑battery threshold
+- **Timed keep‑awake** (15/30/60 min) for debugging, expiring on its own
 - Language selector (EN/DE/ES/FR)
-- Battery level (meter, percentage, and voltage) in the status card
+- Battery level (meter, percentage, voltage, and USB/charging state)
 - Deep sleep on/off toggle
 - Logs and status
+
+**Full walkthrough: [UserManual.md](UserManual.md).**
 
 ---
 
@@ -156,6 +173,13 @@ Details:
 
 ---
 
+### Time
+
+Timestamps come from NTP, with the zone chosen in the web UI. The device carries **two strings per
+zone** — the IANA name for the weather API, and a POSIX `TZ` string for the C library — because
+there is no timezone database on the chip. Handing `configTzTime()` an IANA name like
+`Europe/Berlin` silently yields UTC, which is exactly the bug this arrangement fixed.
+
 ### Battery level: measured, or estimated with a "?"
 
 With no fuel gauge fitted, the firmware still knows exactly how long it spent awake and asleep, so
@@ -188,9 +212,10 @@ There is no alternative on this hardware: the driver board never routes `BAT_4V2
 connector), and on the ESP32‑C6 the only ADC‑capable pins (D0/A0, D1/A1, D2/A2) are already used by
 the panel for RST, CS and BUSY, while D4–D7 have no ADC at all.
 
-The gauge is *on order*. Until it is fitted, the firmware logs `Battery gauge not found on I2C`
-once per wake and shows **?** on the panel / **No sensor** on the web page — no reflash is needed
-when the part arrives.
+The gauge is fitted and reporting real values. Without one, the firmware falls back to a **modelled**
+estimate integrated from awake/asleep time, always shown with a trailing **`?`** so a guess is never
+mistaken for a measurement; that mode needs the web UI's **Battery charged** button as its zero point
+after each charge.
 
 Configuration lives in [include/weather_config.h](include/weather_config.h) (`kBatteryGaugeEnabled`,
 `kBatteryPackMah`, `kBatteryThermistorB`, `kBatteryLowPercent`, and the I²C pins). The gauge is left
@@ -277,6 +302,7 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 
 - `docs/EPAPER_2IN9_BWRY_XIAO_GUIDE.md`
 - `docs/WEATHER_FORECAST_APP.md`
+- `UserManual.md` — using the device: setup, settings, OTA updates, troubleshooting
 - `docs/wire-diagram.md` — LC709203F fuel gauge wiring, step by step
 
 ---
