@@ -29,6 +29,11 @@ EPaper epaper;
 // to raise BUSY within EPD_BUSY_TIMEOUT_MS. Must live at global scope with C++
 // linkage matching the extern declaration in that header.
 volatile bool epdBusyTimedOut = false;
+
+// Survives deep sleep (but not a power cycle or a hard reset). Counts wake
+// cycles and lets /status report how this boot started. Defined here rather than
+// beside setup() so buildStatusJson() can read it.
+RTC_DATA_ATTR uint32_t rtcWakeCount = 0;
 // How long the driver waits on BUSY before giving up. This is a hang guard, not
 // a deadline: a real BWRY full refresh takes 12-16 s, so the operating value must
 // be comfortably above that or the driver powers the panel down mid-refresh and
@@ -43,7 +48,11 @@ namespace
 constexpr uint8_t kForecastDays = 5;
 constexpr uint8_t kMaxLogEntries = 24;
 constexpr uint8_t kMaxScanEntries = 16;
-constexpr uint16_t kHeaderHeight = 22;
+// 26 px, up from 22. The extra 4 px come from the dead margin that used to sit
+// below the cards (renderForecast subtracted 4 from cardHeight and drew nothing
+// there), so the cards keep their exact size and the panel finally uses all
+// 128 px. The banner needs the height for a third 8 px line on the right.
+constexpr uint16_t kHeaderHeight = 26;
 // Battery glyph drawn in the top-right of the header (body + terminal nub).
 constexpr uint16_t kBatteryIconWidth = 30;
 // Horizontal space reserved for the glyph, including the margin around it.
@@ -126,6 +135,14 @@ constexpr uint32_t kRefreshDebounceMs = 2500;
 // True while an OTA upload is in flight. Deep sleep is suppressed entirely for
 // the duration: sleeping mid-flash would leave a half-written app partition.
 bool otaInProgress = false;
+// Timed debug hold. RAM only, deliberately: a keep-awake that survived a reboot
+// would be the same footgun as the permanent sleep toggle it complements.
+uint32_t keepAwakeUntilMs = 0;
+// A USB *host* is attached (SOF frames seen). A plain wall charger supplies VBUS
+// without enumerating, so this means "on the bench", not "charging".
+bool usbHostConnected = false;
+// Inferred from the cell voltage trend, so it also catches a wall charger.
+bool batteryCharging = false;
 // Minutes between forecast refreshes, set from the web UI and persisted in NVS.
 uint16_t refreshIntervalMinutes = kDefaultRefreshMinutes;
 // Location and timezone, all web-configurable and NVS-backed. Defaults come from
@@ -156,8 +173,24 @@ String toDisplayAscii(const String& text);
 // Where header warnings come from: "off", "derived" (our own thresholds on the
 // forecast we already fetch) or "dwd" (official DWD alerts via Bright Sky).
 String warningSource = "derived";
+// What the header's first line shows when there is no warning and no new IP:
+// "now" / "rain" / "sun" / "wind". See buildHeaderPreset().
+String headerMode = "now";
+// The header's second line: another preset, or "off" to leave it blank.
+String headerMode2 = "sun";
+// Which element occupies the left of the banner: "temp" / "location" / "both" /
+// "info" (nothing, giving the whole width to the info lines).
+String headerLayout = "temp";
 // Text of the active warning, empty when none. Recomputed on each refresh.
 String activeWarning;
+// Exactly what was last drawn on the header's first line, exposed in /status so
+// the panel can be verified without standing in front of it.
+String lastHeaderLine;
+String lastHeaderLine2;
+// How this boot started, exposed in /status: distinguishing a timer wake from a
+// cold boot from the outside is otherwise impossible once the 24-entry log ring
+// has scrolled past the boot lines.
+bool bootWasCold = true;
 // True when the header should show SSID/IP instead of weather: set on a cold
 // boot, or when the IP differs from the one last seen. The address is only worth
 // screen space when it is new information.
@@ -220,6 +253,16 @@ struct ForecastData
   char updatedAt[24];
   char updatedDay[12];
   ForecastDay days[kForecastDays];
+  // Header extras. Only today's values are ever shown, so these are stored once
+  // rather than per day.
+  bool currentValid = false;
+  int currentTemp = 0;
+  int feelsLike = 0;
+  int uvIndexMax = 0;
+  int precipitationMm = 0;
+  int windGusts = 0;
+  char sunrise[6] = "--:--";
+  char sunset[6] = "--:--";
 };
 
 ForecastData currentForecast = {};
@@ -340,6 +383,26 @@ struct UiText
   const char* refreshIntervalLabel;
   const char* batteryChargedButton;
   const char* batteryEstimatedNote;
+  const char* labelFeelsLike;
+  const char* labelRain;
+  const char* labelSun;
+  const char* labelWind;
+  const char* labelGust;
+  const char* headerModeLabel;
+  const char* headerMode2Label;
+  const char* layoutLabel;
+  const char* layoutTemp;
+  const char* layoutLocation;
+  const char* layoutBoth;
+  const char* layoutInfo;
+  const char* previewTitle;
+  const char* previewRefresh;
+  const char* modeOff;
+  const char* headerModeNow;
+  const char* headerModeRain;
+  const char* headerModeSun;
+  const char* headerModeWind;
+  const char* keepAwakeLabel;
   const char* warnStorm;
   const char* warnWind;
   const char* warnRain;
@@ -425,6 +488,26 @@ const UiText kUiText[] = {
         "Refresh every",
         "Battery charged",
         "estimated",
+        "Feels",
+        "Rain",
+        "Sun",
+        "Wind",
+        "gust",
+        "Header line",
+        "Second line",
+        "Layout",
+        "Temperature",
+        "Location",
+        "Temperature + location",
+        "Info only",
+        "Panel preview",
+        "Reload preview",
+        "Off",
+        "Feels-like + UV",
+        "Rain in mm",
+        "Sunrise / sunset",
+        "Wind + gusts",
+        "Keep awake (debug)",
         "STORM",
         "WIND",
         "RAIN",
@@ -509,6 +592,26 @@ const UiText kUiText[] = {
         "Aktualisieren alle",
         "Batterie geladen",
         "geschaetzt",
+        "Gefuehlt",
+        "Regen",
+        "Sonne",
+        "Wind",
+        "Boe",
+        "Kopfzeile",
+        "Zweite Zeile",
+        "Layout",
+        "Temperatur",
+        "Ort",
+        "Temperatur + Ort",
+        "Nur Infos",
+        "Anzeigevorschau",
+        "Vorschau neu laden",
+        "Aus",
+        "Gefuehlt + UV",
+        "Regen in mm",
+        "Sonnenauf/-untergang",
+        "Wind + Boeen",
+        "Wach halten (Debug)",
         "GEWITTER",
         "STURM",
         "REGEN",
@@ -593,6 +696,26 @@ const UiText kUiText[] = {
         "Actualizar cada",
         "Bateria cargada",
         "estimado",
+        "Sens",
+        "Lluvia",
+        "Sol",
+        "Viento",
+        "racha",
+        "Linea superior",
+        "Segunda linea",
+        "Diseno",
+        "Temperatura",
+        "Lugar",
+        "Temperatura + lugar",
+        "Solo info",
+        "Vista del panel",
+        "Recargar vista",
+        "Desactivado",
+        "Sensacion + UV",
+        "Lluvia en mm",
+        "Amanecer / ocaso",
+        "Viento + rachas",
+        "Mantener despierto",
         "TORMENTA",
         "VIENTO",
         "LLUVIA",
@@ -677,6 +800,26 @@ const UiText kUiText[] = {
         "Actualiser toutes les",
         "Batterie chargee",
         "estime",
+        "Ressenti",
+        "Pluie",
+        "Soleil",
+        "Vent",
+        "rafale",
+        "Ligne den-tete",
+        "Deuxieme ligne",
+        "Disposition",
+        "Temperature",
+        "Lieu",
+        "Temperature + lieu",
+        "Infos seules",
+        "Apercu du panneau",
+        "Recharger lapercu",
+        "Desactive",
+        "Ressenti + UV",
+        "Pluie en mm",
+        "Lever / coucher",
+        "Vent + rafales",
+        "Garder eveille",
         "ORAGE",
         "VENT",
         "PLUIE",
@@ -1121,6 +1264,10 @@ String buildForecastUrl(const Coordinates& coordinates)
   url += F("&longitude=");
   url += String(coordinates.longitude, 4);
   url += F("&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max");
+  // Header preset data. Requested unconditionally so switching presets never
+  // needs a refetch, and there is only one URL shape to reason about.
+  url += F(",uv_index_max,sunrise,sunset,precipitation_sum,wind_gusts_10m_max");
+  url += F("&current=temperature_2m,apparent_temperature");
   url += F("&forecast_days=5");
   url += useFahrenheit ? F("&temperature_unit=fahrenheit") : F("&temperature_unit=celsius");
   url += useMph ? F("&wind_speed_unit=mph") : F("&wind_speed_unit=kmh");
@@ -1167,6 +1314,46 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
     forecast.days[i].precipitationProbability = precipitation[i].isNull() ? 0 : precipitation[i].as<int>();
     forecast.days[i].windSpeed = static_cast<int>(lroundf(windSpeed[i].as<float>()));
   }
+  // Header extras. All optional: a missing field leaves the default, and the
+  // renderer falls back to the city name / "--:--" rather than showing nonsense.
+  const JsonArray uvIndex = daily["uv_index_max"].as<JsonArray>();
+  if (!uvIndex.isNull() && uvIndex.size() > 0 && !uvIndex[0].isNull()) {
+    forecast.uvIndexMax = static_cast<int>(lroundf(uvIndex[0].as<float>()));
+  }
+  const JsonArray precipitationSum = daily["precipitation_sum"].as<JsonArray>();
+  if (!precipitationSum.isNull() && precipitationSum.size() > 0 && !precipitationSum[0].isNull()) {
+    // Tenths of a millimetre, so 0.4 mm does not round away to "0mm".
+    forecast.precipitationMm = static_cast<int>(lroundf(precipitationSum[0].as<float>() * 10.0f));
+  }
+  const JsonArray gusts = daily["wind_gusts_10m_max"].as<JsonArray>();
+  if (!gusts.isNull() && gusts.size() > 0 && !gusts[0].isNull()) {
+    forecast.windGusts = static_cast<int>(lroundf(gusts[0].as<float>()));
+  }
+  // Sunrise/sunset arrive as "2026-08-28T06:12"; keep the HH:MM tail.
+  const JsonArray sunrise = daily["sunrise"].as<JsonArray>();
+  if (!sunrise.isNull() && sunrise.size() > 0 && sunrise[0].as<const char*>() != nullptr) {
+    const char* iso = sunrise[0].as<const char*>();
+    if (strlen(iso) >= 16) {
+      snprintf(forecast.sunrise, sizeof(forecast.sunrise), "%.5s", iso + 11);
+    }
+  }
+  const JsonArray sunset = daily["sunset"].as<JsonArray>();
+  if (!sunset.isNull() && sunset.size() > 0 && sunset[0].as<const char*>() != nullptr) {
+    const char* iso = sunset[0].as<const char*>();
+    if (strlen(iso) >= 16) {
+      snprintf(forecast.sunset, sizeof(forecast.sunset), "%.5s", iso + 11);
+    }
+  }
+
+  const JsonObject current = doc["current"];
+  if (!current.isNull() && !current["temperature_2m"].isNull()) {
+    forecast.currentTemp = static_cast<int>(lroundf(current["temperature_2m"].as<float>()));
+    forecast.feelsLike = current["apparent_temperature"].isNull()
+                             ? forecast.currentTemp
+                             : static_cast<int>(lroundf(current["apparent_temperature"].as<float>()));
+    forecast.currentValid = true;
+  }
+
   updateClock(coordinates.posixTz, forecast);
   return true;
 }
@@ -1853,6 +2040,42 @@ uint8_t estimatedBatteryPercent()
   return static_cast<uint8_t>(((capacityUah - consumedUah) * 100ULL) / capacityUah);
 }
 
+// Previous cell voltage in millivolts, kept in RTC memory so it survives deep
+// sleep without an NVS write - the per-cycle write was just removed and must not
+// come back by another route. 0 means "no previous reading".
+RTC_DATA_ATTR uint16_t rtcLastCellMillivolts = 0;
+
+// Charging cannot be measured on this board: no charger signal reaches the XIAO.
+// Two independent inferences cover the realistic cases between them:
+//
+//   * usbHostConnected - SOF frames from a USB host. True on the bench, but a
+//     plain wall charger supplies VBUS without enumerating, so it stays false.
+//   * a rising cell voltage, or one sitting near the 4.2 V charge ceiling, which
+//     is what catches the wall-charger case.
+//
+// Both are guesses, not measurements, and the UI labels them as such.
+void updatePowerState(const BatteryStatus& battery)
+{
+#if ARDUINO_USB_CDC_ON_BOOT
+  usbHostConnected = Serial.isPlugged();
+#else
+  usbHostConnected = false;
+#endif
+
+  batteryCharging = false;
+  if (!battery.valid || battery.estimated) {
+    return;
+  }
+
+  const uint16_t millivolts = static_cast<uint16_t>(battery.volts * 1000.0f);
+  if (millivolts >= 4180) {
+    batteryCharging = true;
+  } else if (rtcLastCellMillivolts != 0 && millivolts > (rtcLastCellMillivolts + 15)) {
+    batteryCharging = true;
+  }
+  rtcLastCellMillivolts = millivolts;
+}
+
 // Single seam for battery state. Prefers the fuel gauge; falls back to the
 // modeled estimate so the UI can still show something useful (flagged as a
 // guess) when no gauge is fitted.
@@ -1923,15 +2146,101 @@ void drawBatteryIcon(int32_t x, int32_t y, const BatteryStatus& battery)
   epaper.setTextColor(TFT_WHITE, TFT_BLACK);
 }
 
-// Draw the fixed top banner: city on the left, Wi-Fi and updated time right-aligned.
+// The header's first line, when there is nothing more urgent to say. Each preset
+// deliberately avoids anything the day cards already show: they carry the icon,
+// the label, the max temp, the min temp and the precipitation *probability*, so
+// repeating those here would waste the line.
+//
+// No degree character: the GLCD font is CP437-style and cannot render one, and a
+// right-aligned string has no fixed x for drawDegreeSymbol() to draw a circle at.
+String buildHeaderPreset(const ForecastData& forecast, const String& mode)
+{
+  const ForecastDay& today = forecast.days[0];
+
+  if (mode == "off") {
+    return String();
+  }
+
+  if (mode == "rain") {
+    // Amount, which the panel never shows, alongside the probability it does.
+    String line = String(ui().labelRain) + " ";
+    line += String(forecast.precipitationMm / 10);
+    if ((forecast.precipitationMm % 10) != 0) {
+      line += "." + String(forecast.precipitationMm % 10);
+    }
+    line += "mm " + String(today.precipitationProbability) + "%";
+    return line;
+  }
+
+  if (mode == "sun") {
+    return String(ui().labelSun) + " " + forecast.sunrise + "-" + forecast.sunset;
+  }
+
+  if (mode == "wind") {
+    String line = String(ui().labelWind) + " " + today.windSpeed;
+    if (forecast.windGusts > today.windSpeed) {
+      line += String(" ") + ui().labelGust + " " + forecast.windGusts;
+    }
+    return line;
+  }
+
+  // "now": feels-like and UV. The actual temperature is on the left of the
+  // header, so showing it again here would be the duplication this replaced.
+  String line;
+  if (forecast.currentValid) {
+    line = String(ui().labelFeelsLike) + " " + forecast.feelsLike;
+  }
+  if (forecast.uvIndexMax > 0) {
+    if (!line.isEmpty()) {
+      line += " ";
+    }
+    line += String("UV ") + forecast.uvIndexMax;
+  }
+  return line;
+}
+
+// Draw the fixed top banner: current temperature on the left, status line and
+// updated time right-aligned.
 // Keeping the banner black preserves contrast for the red/yellow/white text colors.
 void renderHeader(const ForecastData& forecast)
 {
   const uint16_t displayWidth = epaper.width();
   epaper.fillRect(0, 0, displayWidth, kHeaderHeight, TFT_BLACK);
   epaper.drawFastHLine(0, kHeaderHeight - 1, displayWidth, TFT_RED);
-  // Use a bold free font for the city name to improve legibility.
-  drawFreeFontLeft(forecast.location, 4, 2, &FreeSansBold9pt7b, TFT_YELLOW, TFT_BLACK);
+  // Left side, per the selected layout. Only this element and the resulting
+  // clamp width differ between layouts; the right-hand column is identical in
+  // all four. "temp" and "both" fall back to the city name when there is no
+  // current reading yet, so the corner is never blank.
+  const bool wantTemperature = (headerLayout == "temp" || headerLayout == "both") && forecast.currentValid;
+  const bool wantLocation = (headerLayout == "location" || headerLayout == "both") ||
+                            ((headerLayout == "temp") && !forecast.currentValid);
+  uint16_t leftWidth = 0;
+
+  if (wantTemperature) {
+    const String tempText = String(forecast.currentTemp);
+    // The forecast-temperature font, so the number reads at the same weight as
+    // the figures in the cards below it.
+    drawFreeFontLeft(tempText, 4, 0, &FreeSansBold12pt7b, TFT_YELLOW, TFT_BLACK);
+    epaper.setFreeFont(&FreeSansBold12pt7b);
+    const uint16_t tempWidth = epaper.textWidth(tempText);
+    epaper.setFreeFont(nullptr);
+    // Free fonts carry no degree glyph; drawDegreeSymbol() draws the ring, which
+    // is only possible because the left column sits at a known x.
+    drawDegreeSymbol(4 + tempWidth + 4, 5, 2, TFT_YELLOW);
+    leftWidth = tempWidth + 10;
+  }
+
+  if (wantLocation) {
+    if (headerLayout == "both") {
+      // Small, tucked under the temperature, clear of the red rule at the bottom.
+      epaper.setTextColor(TFT_YELLOW, TFT_BLACK);
+      epaper.drawString(forecast.location, 4, 17, 1);
+      leftWidth = max(leftWidth, static_cast<uint16_t>(epaper.textWidth(forecast.location, 1)));
+    } else {
+      drawFreeFontLeft(forecast.location, 4, 2, &FreeSansBold9pt7b, TFT_YELLOW, TFT_BLACK);
+      leftWidth = epaper.textWidth(forecast.location, 2);
+    }
+  }
 
   // A low pack gets a red strip along the bottom of the banner - visible at a
   // glance from across the room, unlike the small percentage in the glyph.
@@ -1966,26 +2275,30 @@ void renderHeader(const ForecastData& forecast)
     headerLine = activeWarning;
     headerColor = TFT_RED;
   } else {
-    const ForecastDay& today = forecast.days[0];
-    headerLine = weatherLabel(today) + " " + today.tempMax + "/" + today.tempMin;
-    if (today.precipitationProbability > 0) {
-      headerLine += String(" ") + today.precipitationProbability + "%";
-    }
+    headerLine = buildHeaderPreset(forecast, headerMode);
   }
 
-  const uint16_t titleWidth = epaper.textWidth(forecast.location, 2);
-  const uint16_t headerMaxWidth =
-      (textRightEdge > titleWidth + 12) ? (textRightEdge - titleWidth - 12) : 0;
-  epaper.setTextColor(headerColor, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(headerLine, headerMaxWidth, 1), textRightEdge, 2, 1);
+  // Three 8 px lines, which is what the 26 px banner bought. Clamp against
+  // whatever the layout actually drew on the left, so "info" gets the full width.
+  const uint16_t maxWidth = (textRightEdge > leftWidth + 12) ? (textRightEdge - leftWidth - 12) : 0;
 
-  // Keep the location on the left and right-align the updated timestamp on the second line.
+  lastHeaderLine = headerLine;
+  epaper.setTextColor(headerColor, TFT_BLACK);
+  epaper.drawRightString(clampTextToWidth(headerLine, maxWidth, 1), textRightEdge, 0, 1);
+
+  // Line 2: the second preset, independent of the first. "off" leaves it blank
+  // rather than drawing a stale value.
+  const String secondLine = buildHeaderPreset(forecast, headerMode2);
+  lastHeaderLine2 = secondLine;
+  if (!secondLine.isEmpty()) {
+    epaper.setTextColor(TFT_YELLOW, TFT_BLACK);
+    epaper.drawRightString(clampTextToWidth(secondLine, maxWidth, 1), textRightEdge, 9, 1);
+  }
+
+  // Line 3: when the panel was last updated.
   const String updatedLabel = String(ui().labelUpdated) + ": " + forecast.updatedDay + " " + forecast.updatedAt;
-  const uint16_t locationWidth = epaper.textWidth(forecast.location, 1);
-  const uint16_t updatedMaxWidth =
-      (textRightEdge > locationWidth + 12) ? (textRightEdge - locationWidth - 12) : 0;
   epaper.setTextColor(TFT_WHITE, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(updatedLabel, updatedMaxWidth, 1), textRightEdge, 13, 1);
+  epaper.drawRightString(clampTextToWidth(updatedLabel, maxWidth, 1), textRightEdge, 18, 1);
 }
 
 // Draw a single forecast day card. Layout is tuned to avoid text overlap.
@@ -2042,7 +2355,9 @@ void renderForecast(const ForecastData& forecast)
   renderHeader(forecast);
 
   const uint16_t usableTop = kHeaderHeight + 4;
-  const uint16_t cardHeight = displayHeight - usableTop - 4;
+  // No bottom margin: those 4 px now belong to the taller banner, which keeps
+  // cardHeight identical to before at 98 px.
+  const uint16_t cardHeight = displayHeight - usableTop;
   const uint16_t totalGap = kCellGap * (kForecastDays - 1);
   const uint16_t cardWidth = (displayWidth - totalGap) / kForecastDays;
 
@@ -2264,6 +2579,76 @@ uint32_t secondsUntilQuietEnds(const struct tm& localTime)
   }
   const int32_t seconds = hoursAhead * 3600 - localTime.tm_min * 60 - localTime.tm_sec;
   return (seconds > 0) ? static_cast<uint32_t>(seconds) : 60;
+}
+
+bool isHeaderModeSupported(const String& mode)
+{
+  return mode == "now" || mode == "rain" || mode == "sun" || mode == "wind";
+}
+
+// The second line additionally accepts "off".
+bool isHeaderMode2Supported(const String& mode)
+{
+  return mode == "off" || isHeaderModeSupported(mode);
+}
+
+bool isHeaderLayoutSupported(const String& layout)
+{
+  return layout == "temp" || layout == "location" || layout == "both" || layout == "info";
+}
+
+void loadHeaderPreference()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while loading header mode. Using default.");
+    return;
+  }
+  const String stored = preferences.getString("hdr_mode", "now");
+  const String stored2 = preferences.getString("hdr_mode2", "sun");
+  const String storedLayout = preferences.getString("layout", "temp");
+  preferences.end();
+  if (isHeaderModeSupported(stored)) {
+    headerMode = stored;
+  }
+  if (isHeaderMode2Supported(stored2)) {
+    headerMode2 = stored2;
+  }
+  if (isHeaderLayoutSupported(storedLayout)) {
+    headerLayout = storedLayout;
+  }
+}
+
+void saveHeaderPreference(const String& mode)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving header mode.");
+    return;
+  }
+  preferences.putString("hdr_mode", mode);
+  preferences.end();
+  headerMode = mode;
+}
+
+void saveHeaderMode2Preference(const String& mode)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving second header mode.");
+    return;
+  }
+  preferences.putString("hdr_mode2", mode);
+  preferences.end();
+  headerMode2 = mode;
+}
+
+void saveHeaderLayoutPreference(const String& layout)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving header layout.");
+    return;
+  }
+  preferences.putString("layout", layout);
+  preferences.end();
+  headerLayout = layout;
 }
 
 bool isWarningSourceSupported(const String& source)
@@ -2995,6 +3380,43 @@ String buildStatusJson()
   json += activeWarning.isEmpty() ? "false" : "true";
   json += ",\"showNetworkInfo\":";
   json += showNetworkInfo ? "true" : "false";
+  json += ",\"layout\":\"";
+  json += jsonEscape(headerLayout);
+  json += "\",\"headerMode2\":\"";
+  json += jsonEscape(headerMode2);
+  json += "\",\"headerLine2\":\"";
+  json += jsonEscape(lastHeaderLine2);
+  json += "\",\"coldBoot\":";
+  json += bootWasCold ? "true" : "false";
+  json += ",\"wakeCount\":";
+  json += String(rtcWakeCount);
+  json += ",\"headerLine\":\"";
+  json += jsonEscape(lastHeaderLine);
+  json += "\",\"currentTemp\":";
+  json += String(currentForecast.currentValid ? currentForecast.currentTemp : 0);
+  json += ",\"feelsLike\":";
+  json += String(currentForecast.currentValid ? currentForecast.feelsLike : 0);
+  json += ",\"uvIndexMax\":";
+  json += String(currentForecast.uvIndexMax);
+  json += ",\"precipitationTenthMm\":";
+  json += String(currentForecast.precipitationMm);
+  json += ",\"windGusts\":";
+  json += String(currentForecast.windGusts);
+  json += ",\"sunrise\":\"";
+  json += currentForecast.sunrise;
+  json += "\",\"sunset\":\"";
+  json += currentForecast.sunset;
+  json += "\",\"headerMode\":\"";
+  json += jsonEscape(headerMode);
+  json += "\",\"usbConnected\":";
+  json += usbHostConnected ? "true" : "false";
+  json += ",\"charging\":";
+  json += batteryCharging ? "true" : "false";
+  json += ",\"keepAwakeSecondsLeft\":";
+  {
+    const int32_t leftMs = static_cast<int32_t>(keepAwakeUntilMs - millis());
+    json += String((keepAwakeUntilMs != 0 && leftMs > 0) ? (leftMs / 1000) : 0);
+  }
   json += ",\"batteryVolts\":\"";
   json += currentBattery.valid ? batteryVoltsText(currentBattery) : String("");
   json += "\",\"deepSleepEnabled\":";
@@ -3196,6 +3618,20 @@ String buildMainPage()
       display: flex; justify-content: space-between; align-items: center; gap: 10px;
       margin-top: 10px; font-size: 12px; color: var(--info-text);
     }
+    /* 128x296 buffer rotated a quarter turn into the 296x128 view the panel shows. */
+    .panel-preview {
+      height: 128px; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; margin: 10px 0;
+      border: 1px solid var(--input-border); border-radius: 4px; background: #fff;
+    }
+    .panel-preview img {
+      /* The buffer is portrait and its first row is the panel's right edge, so
+         the quarter turn is anticlockwise. Turning it the other way renders the
+         preview upside down. */
+      transform: rotate(-90deg);
+      image-rendering: pixelated;
+      max-width: none;
+    }
     .sleep-hint { font-size: 11px; opacity: 0.75; margin-top: 4px; color: var(--info-text); }
     label { display: block; margin: 10px 0 4px; font-size: 14px; color: var(--label-text); }
     select, input, textarea {
@@ -3306,6 +3742,15 @@ String buildMainPage()
       </div>
     </div>
     <div class="card">
+      <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
+      <!-- The framebuffer is the panel's native portrait 128x296; rotating here
+           avoids second-guessing the sprite's coordinate mapping on the device. -->
+      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="panel"></div>
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-nav" onclick="reloadPanel()">{{PREVIEW_REFRESH}}</button>
+      </div>
+    </div>
+    <div class="card">
       <h2 class="card-title">{{SETTINGS_TITLE}}</h2>
       <label for="locLabel">{{LOCATION_LABEL}}</label>
       <input type="text" id="locLabel" maxlength="24">
@@ -3315,6 +3760,28 @@ String buildMainPage()
       <input type="number" id="lon" step="0.0001" min="-180" max="180">
       <label for="timezone">{{TIMEZONE_LABEL}}</label>
       <select id="timezone">{{TIMEZONE_OPTIONS}}</select>
+      <label for="layout">{{LAYOUT_LABEL}}</label>
+      <select id="layout">
+        <option value="temp">{{LAYOUT_TEMP}}</option>
+        <option value="location">{{LAYOUT_LOCATION}}</option>
+        <option value="both">{{LAYOUT_BOTH}}</option>
+        <option value="info">{{LAYOUT_INFO}}</option>
+      </select>
+      <label for="headerMode">{{HEADER_MODE_LABEL}}</label>
+      <select id="headerMode">
+        <option value="now">{{HEADER_MODE_NOW}}</option>
+        <option value="rain">{{HEADER_MODE_RAIN}}</option>
+        <option value="sun">{{HEADER_MODE_SUN}}</option>
+        <option value="wind">{{HEADER_MODE_WIND}}</option>
+      </select>
+      <label for="headerMode2">{{HEADER_MODE2_LABEL}}</label>
+      <select id="headerMode2">
+        <option value="off">{{MODE_OFF}}</option>
+        <option value="now">{{HEADER_MODE_NOW}}</option>
+        <option value="rain">{{HEADER_MODE_RAIN}}</option>
+        <option value="sun">{{HEADER_MODE_SUN}}</option>
+        <option value="wind">{{HEADER_MODE_WIND}}</option>
+      </select>
       <label for="warningSource">{{WARNING_SOURCE_LABEL}}</label>
       <select id="warningSource">
         <option value="off">{{WARN_SRC_OFF}}</option>
@@ -3346,6 +3813,14 @@ String buildMainPage()
       <div class="button-row" style="grid-template-columns:1fr">
         <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
       </div>
+      <label>{{KEEP_AWAKE_LABEL}}</label>
+      <div class="button-row" style="grid-template-columns:repeat(4,1fr)">
+        <button class="btn-nav" onclick="keepAwake(15)">15m</button>
+        <button class="btn-nav" onclick="keepAwake(30)">30m</button>
+        <button class="btn-nav" onclick="keepAwake(60)">60m</button>
+        <button class="btn-nav" onclick="keepAwake(0)">off</button>
+      </div>
+      <div id="keepAwakeState" class="sleep-hint"></div>
     </div>
     <div class="card">
       <h2 class="card-title">{{OTA_TITLE}}</h2>
@@ -3414,7 +3889,8 @@ String buildMainPage()
       const low = percent <= {{BATTERY_LOW_PERCENT}} ? ' low' : '';
       const volts = status.batteryVolts ? ` (${status.batteryVolts} V)` : '';
       const note = status.batteryEstimated ? ` ~${ui.batteryEstimatedNote}` : '';
-      return `<span class="battery"><span class="battery-body"><span class="battery-fill${low}" style="width:${percent}%"></span></span>${percent}%${volts}${note}</span>`;
+      const power = status.charging ? ' \u00b7 charging?' : (status.usbConnected ? ' \u00b7 USB' : '');
+      return `<span class="battery"><span class="battery-body"><span class="battery-fill${low}" style="width:${percent}%"></span></span>${percent}%${volts}${note}${power}</span>`;
     }
     async function scanNetworks() {
       const select = document.getElementById('ssid');
@@ -3465,7 +3941,16 @@ String buildMainPage()
       setIfIdle('lat', status.latitude);
       setIfIdle('lon', status.longitude);
       setIfIdle('timezone', status.timezone);
+      setIfIdle('layout', status.layout);
+      setIfIdle('headerMode', status.headerMode);
+      setIfIdle('headerMode2', status.headerMode2);
       setIfIdle('warningSource', status.warningSource);
+      const ka = document.getElementById('keepAwakeState');
+      if (ka) {
+        ka.textContent = status.keepAwakeSecondsLeft > 0
+          ? `awake for another ${Math.round(status.keepAwakeSecondsLeft / 60)} min`
+          : '';
+      }
       setIfIdle('unitTemp', status.fahrenheit ? 'f' : 'c');
       setIfIdle('unitWind', status.mph ? 'mph' : 'kmh');
       setIfIdle('quietEnabled', status.quietEnabled);
@@ -3585,6 +4070,17 @@ String buildMainPage()
           mph: document.getElementById('unitWind').value === 'mph'
         })
       });
+      await fetch('/layout', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({layout: document.getElementById('layout').value})
+      });
+      await fetch('/headerMode', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          mode: document.getElementById('headerMode').value,
+          mode2: document.getElementById('headerMode2').value
+        })
+      });
       await fetch('/warningSource', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({source: document.getElementById('warningSource').value})
@@ -3600,6 +4096,18 @@ String buildMainPage()
         })
       });
       alert(await r.text());
+      await updateStatus();
+    }
+    function reloadPanel() {
+      // Cache-bust: the panel only changes on a render, but the browser cannot know that.
+      document.getElementById('panelImg').src = '/panel.bmp?t=' + Date.now();
+    }
+    async function keepAwake(minutes) {
+      const r = await fetch('/keepAwake', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({minutes})
+      });
+      document.getElementById('keepAwakeState').textContent = await r.text();
       await updateStatus();
     }
     function uploadFirmware() {
@@ -3645,6 +4153,21 @@ String buildMainPage()
   page.replace("{{BATTERY_ESTIMATED_NOTE}}", t.batteryEstimatedNote);
   page.replace("{{SETTINGS_TITLE}}", t.settingsTitle);
   page.replace("{{WARNING_SOURCE_LABEL}}", t.warningSourceLabel);
+  page.replace("{{HEADER_MODE_LABEL}}", t.headerModeLabel);
+  page.replace("{{HEADER_MODE2_LABEL}}", t.headerMode2Label);
+  page.replace("{{LAYOUT_LABEL}}", t.layoutLabel);
+  page.replace("{{LAYOUT_TEMP}}", t.layoutTemp);
+  page.replace("{{LAYOUT_LOCATION}}", t.layoutLocation);
+  page.replace("{{LAYOUT_BOTH}}", t.layoutBoth);
+  page.replace("{{LAYOUT_INFO}}", t.layoutInfo);
+  page.replace("{{PREVIEW_TITLE}}", t.previewTitle);
+  page.replace("{{PREVIEW_REFRESH}}", t.previewRefresh);
+  page.replace("{{MODE_OFF}}", t.modeOff);
+  page.replace("{{HEADER_MODE_NOW}}", t.headerModeNow);
+  page.replace("{{HEADER_MODE_RAIN}}", t.headerModeRain);
+  page.replace("{{HEADER_MODE_SUN}}", t.headerModeSun);
+  page.replace("{{HEADER_MODE_WIND}}", t.headerModeWind);
+  page.replace("{{KEEP_AWAKE_LABEL}}", t.keepAwakeLabel);
   page.replace("{{WARN_SRC_OFF}}", t.warnSourceOff);
   page.replace("{{WARN_SRC_DERIVED}}", t.warnSourceDerived);
   page.replace("{{WARN_SRC_DWD}}", t.warnSourceDwd);
@@ -3895,6 +4418,7 @@ void handleStatus()
 {
   noteWebActivity();
   currentBattery = readBattery();
+  updatePowerState(currentBattery);
   server.send(200, "application/json", buildStatusJson());
 }
 
@@ -4039,6 +4563,7 @@ bool refreshForecastAndDisplay()
   // Sample the battery before drawing so the header glyph matches this frame,
   // and grant a fresh awake window so the web UI is reachable after an update.
   currentBattery = readBattery();
+  updatePowerState(currentBattery);
   extendAwakeWindow(kAwakeWindowMs);
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -4327,6 +4852,149 @@ void handleWarningSource()
   requestRefresh();
 }
 
+void handleKeepAwake()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  uint32_t minutes = doc["minutes"] | 0;
+  // Clamped so a debug hold cannot quietly become a permanent drain.
+  if (minutes > 60) {
+    minutes = 60;
+  }
+
+  if (minutes == 0) {
+    keepAwakeUntilMs = 0;
+    addLog("Keep-awake cancelled.");
+    server.send(200, "text/plain", "Keep-awake off.");
+    return;
+  }
+
+  keepAwakeUntilMs = millis() + (minutes * 60UL * 1000UL);
+  addLog(String("Keep-awake for ") + minutes + " min.");
+  server.send(200, "text/plain", String("Staying awake for ") + minutes + " min.");
+}
+
+void handleHeaderMode()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const String mode = doc["mode"].as<String>();
+  if (!isHeaderModeSupported(mode)) {
+    server.send(400, "text/plain", "Unsupported header mode");
+    return;
+  }
+  // The second line is optional in the request, so an older client that only
+  // knows about one line keeps working.
+  const String mode2 = doc["mode2"].as<String>();
+  if (!mode2.isEmpty() && !isHeaderMode2Supported(mode2)) {
+    server.send(400, "text/plain", "Unsupported second header mode");
+    return;
+  }
+
+  saveHeaderPreference(mode);
+  if (!mode2.isEmpty()) {
+    saveHeaderMode2Preference(mode2);
+  }
+  addLog(String("Header lines set to ") + mode + " / " + headerMode2 + ".");
+  server.send(200, "text/plain", String("Header line set to ") + mode + ".");
+  requestRefresh();
+}
+
+void handleLayout()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const String layout = doc["layout"].as<String>();
+  if (!isHeaderLayoutSupported(layout)) {
+    server.send(400, "text/plain", "Unsupported layout");
+    return;
+  }
+
+  saveHeaderLayoutPreference(layout);
+  addLog(String("Header layout set to ") + layout + ".");
+  server.send(200, "text/plain", String("Layout set to ") + layout + ".");
+  requestRefresh();
+}
+
+// Serve the panel's framebuffer as a BMP, so the display can be inspected from
+// the web UI instead of by walking over to it.
+//
+// The sprite is 4 bits per pixel, which is exactly what a 4-bit BMP stores, so
+// the pixel body is a near-verbatim dump of the buffer: ~19 KB, no conversion
+// loop, no image library. The palette maps the four e-paper colours; the sprite
+// uses 0x00 white, 0x0F black, 0x0B yellow, 0x06 red.
+//
+// The buffer is in the panel's native portrait orientation (128x296) regardless
+// of the rotation used for drawing, so the image is emitted portrait and the web
+// page rotates it. Doing the rotation here would mean second-guessing the
+// sprite's internal coordinate mapping for no benefit.
+void handlePanelBitmap()
+{
+  noteWebActivity();
+#ifdef EPAPER_ENABLE
+  constexpr int32_t kBmpWidth = TFT_WIDTH;    // 128
+  constexpr int32_t kBmpHeight = TFT_HEIGHT;  // 296
+  constexpr uint32_t kRowBytes = kBmpWidth / 2;  // 4bpp, already 4-byte aligned
+  constexpr uint32_t kPixelBytes = kRowBytes * kBmpHeight;
+  constexpr uint32_t kPaletteBytes = 16 * 4;
+  constexpr uint32_t kOffset = 14 + 40 + kPaletteBytes;
+  constexpr uint32_t kFileSize = kOffset + kPixelBytes;
+
+  uint8_t header[kOffset] = {0};
+  // BITMAPFILEHEADER
+  header[0] = 'B';
+  header[1] = 'M';
+  memcpy(&header[2], &kFileSize, 4);
+  memcpy(&header[10], &kOffset, 4);
+  // BITMAPINFOHEADER
+  const uint32_t infoSize = 40;
+  memcpy(&header[14], &infoSize, 4);
+  memcpy(&header[18], &kBmpWidth, 4);
+  // Negative height: rows top-down, matching the buffer's order.
+  const int32_t negHeight = -kBmpHeight;
+  memcpy(&header[22], &negHeight, 4);
+  const uint16_t planes = 1;
+  const uint16_t bpp = 4;
+  memcpy(&header[26], &planes, 2);
+  memcpy(&header[28], &bpp, 2);
+  memcpy(&header[34], &kPixelBytes, 4);
+  const uint32_t paletteUsed = 16;
+  memcpy(&header[46], &paletteUsed, 4);
+
+  // Palette entries are BGRA. Everything not one of the four panel colours stays
+  // black, which makes an unexpected nibble value obvious rather than invisible.
+  uint8_t* palette = &header[54];
+  auto setPalette = [palette](uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
+    palette[index * 4 + 0] = b;
+    palette[index * 4 + 1] = g;
+    palette[index * 4 + 2] = r;
+  };
+  setPalette(0x00, 0xFF, 0xFF, 0xFF);  // white
+  setPalette(0x06, 0xE0, 0x20, 0x20);  // red
+  setPalette(0x0B, 0xF0, 0xC0, 0x10);  // yellow
+  setPalette(0x0F, 0x00, 0x00, 0x00);  // black
+
+  server.setContentLength(kFileSize);
+  server.send(200, "image/bmp", "");
+  server.sendContent(reinterpret_cast<const char*>(header), sizeof(header));
+  server.sendContent(reinterpret_cast<const char*>(epaper.getPointer()), kPixelBytes);
+#else
+  server.send(404, "text/plain", "No panel");
+#endif
+}
+
 void handleBatteryFull()
 {
   noteWebActivity();
@@ -4432,6 +5100,10 @@ void setupWebServer()
   server.on("/units", HTTP_POST, handleUnits);
   server.on("/powerOptions", HTTP_POST, handlePowerOptions);
   server.on("/warningSource", HTTP_POST, handleWarningSource);
+  server.on("/headerMode", HTTP_POST, handleHeaderMode);
+  server.on("/layout", HTTP_POST, handleLayout);
+  server.on("/keepAwake", HTTP_POST, handleKeepAwake);
+  server.on("/panel.bmp", HTTP_GET, handlePanelBitmap);
   server.on("/batteryFull", HTTP_POST, handleBatteryFull);
   server.on("/panelProbe", HTTP_GET, handlePanelProbe);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
@@ -4488,6 +5160,7 @@ void setupRuntime()
   loadDisplayPreferences();
   loadPowerPreferences();
   loadWarningPreference();
+  loadHeaderPreference();
   loadConsumedCharge();
   loadStaticIpConfig();
   setupWebServer();
@@ -4518,10 +5191,6 @@ void setupRuntime()
 }
 }  // namespace
 
-// Survives deep sleep (but not a power cycle or a hard reset). Used for logging
-// how the current wake cycle started.
-RTC_DATA_ATTR uint32_t rtcWakeCount = 0;
-
 void setup()
 {
   Serial.begin(115200);
@@ -4548,6 +5217,7 @@ void setup()
   // Show SSID/IP on the panel after a power-on or reset - that is when someone is
   // standing there checking it worked. A timer wake starts with it hidden, and
   // noteCurrentIpAddress() turns it back on if the address actually moved.
+  bootWasCold = coldBoot;
   showNetworkInfo = coldBoot;
   setupBatteryGauge(coldBoot);
   setupRuntime();
@@ -4605,7 +5275,10 @@ void loop()
   // needs it. A failed forecast retries sooner than the normal cycle.
   const bool awakeWindowExpired = static_cast<int32_t>(millis() - awakeUntilMs) > 0;
   const bool awakeCapReached = millis() > kMaxAwakeMs;
-  if (deepSleepEnabled && !apModeActive && !otaInProgress && !refreshPending &&
+  // A timed keep-awake outranks the cap: the cap exists to stop traffic holding
+  // the device up indefinitely, not to cut short a hold that expires on its own.
+  const bool keepAwakeActive = (keepAwakeUntilMs != 0) && (static_cast<int32_t>(keepAwakeUntilMs - millis()) > 0);
+  if (deepSleepEnabled && !apModeActive && !otaInProgress && !refreshPending && !keepAwakeActive &&
       (awakeWindowExpired || awakeCapReached)) {
     if (awakeCapReached && !awakeWindowExpired) {
       addLog("Awake cap reached; sleeping despite recent web activity.");
