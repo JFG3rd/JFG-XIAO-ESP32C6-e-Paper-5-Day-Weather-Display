@@ -389,6 +389,7 @@ struct UiText
   const char* refreshIntervalLabel;
   const char* batteryChargedButton;
   const char* batteryEstimatedNote;
+  const char* labelNow;
   const char* labelFeelsLike;
   const char* labelRain;
   const char* labelSun;
@@ -501,6 +502,7 @@ const UiText kUiText[] = {
         "Refresh every",
         "Battery charged",
         "estimated",
+        "NOW",
         "Feels",
         "Rain",
         "Sun",
@@ -612,6 +614,7 @@ const UiText kUiText[] = {
         "Aktualisieren alle",
         "Batterie geladen",
         "geschaetzt",
+        "JETZT",
         "Gefuehlt",
         "Regen",
         "Sonne",
@@ -723,6 +726,7 @@ const UiText kUiText[] = {
         "Actualizar cada",
         "Bateria cargada",
         "estimado",
+        "AHORA",
         "Sens",
         "Lluvia",
         "Sol",
@@ -834,6 +838,7 @@ const UiText kUiText[] = {
         "Actualiser toutes les",
         "Batterie chargee",
         "estime",
+        "MAINT",
         "Ressenti",
         "Pluie",
         "Soleil",
@@ -2170,6 +2175,18 @@ String batteryVoltsText(const BatteryStatus& battery)
   return String(battery.volts, 2);
 }
 
+// Up and down markers. Triangles are the one glyph shape that stays unambiguous
+// at this size - a droplet or thermometer at 6 px is a blob.
+void drawUpMarker(int16_t x, int16_t y, uint16_t color)
+{
+  epaper.fillTriangle(x, y + 5, x + 3, y, x + 6, y + 5, color);
+}
+
+void drawDownMarker(int16_t x, int16_t y, uint16_t color)
+{
+  epaper.fillTriangle(x, y, x + 6, y, x + 3, y + 5, color);
+}
+
 // Battery glyph for the header: white outline, white interior so the overlaid
 // percentage stays legible, and a yellow (red when low) fill bar for the charge
 // level. Occupies kBatteryIconWidth x kBatteryIconHeight pixels from (x, y).
@@ -2180,10 +2197,12 @@ void drawBatteryIcon(int32_t x, int32_t y, const BatteryStatus& battery)
   const int32_t interiorWidth = kBodyWidth - 2;
   const int32_t interiorHeight = kBodyHeight - 2;
 
-  // Body outline plus the positive terminal nub on the right.
-  epaper.drawRect(x, y, kBodyWidth, kBodyHeight, TFT_WHITE);
-  epaper.fillRect(x + kBodyWidth, y + 4, 2, 5, TFT_WHITE);
-  epaper.fillRect(x + 1, y + 1, interiorWidth, interiorHeight, TFT_WHITE);
+  // A white interior with a black outline, so the glyph reads as a chip on any
+  // background: black banner, yellow warning strip, or white card. A white
+  // outline (the previous treatment) disappears entirely on yellow.
+  epaper.fillRect(x, y, kBodyWidth, kBodyHeight, TFT_WHITE);
+  epaper.drawRect(x, y, kBodyWidth, kBodyHeight, TFT_BLACK);
+  epaper.fillRect(x + kBodyWidth, y + 4, 2, 5, TFT_BLACK);
 
   if (battery.valid) {
     const int32_t fillWidth = (interiorWidth * battery.percent) / 100;
@@ -2430,37 +2449,6 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
 }
 
 // Full-screen forecast render. This redraws the full frame (not partial refresh).
-// Half-size icon, produced by box-reducing the 40x40 art rather than shipping a
-// second icon set. Each 2x2 source block collapses to one pixel, preferring any
-// non-white pixel in the block so thin outlines survive the reduction - plain
-// nearest-neighbour drops them and the glyph falls apart at 20 px.
-void drawWeatherIcon20(const ForecastDay& day, int16_t x, int16_t y)
-{
-  const uint8_t* icon = weatherIconData(day);
-  if (icon == nullptr) {
-    return;
-  }
-  constexpr int16_t kSrc = kWeatherIcon40Width;
-  for (int16_t oy = 0; oy < kSrc / 2; ++oy) {
-    for (int16_t ox = 0; ox < kSrc / 2; ++ox) {
-      uint8_t chosen = 0x00;  // white
-      for (int16_t dy = 0; dy < 2; ++dy) {
-        for (int16_t dx = 0; dx < 2; ++dx) {
-          const int32_t index = (oy * 2 + dy) * kSrc + (ox * 2 + dx);
-          const uint8_t byte = pgm_read_byte(&icon[index / 2]);
-          const uint8_t value = (index & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
-          if (value != 0x00) {
-            chosen = value;
-          }
-        }
-      }
-      if (chosen != 0x00) {
-        epaper.drawPixel(x + ox, y + oy, chosen);
-      }
-    }
-  }
-}
-
 // A vertical bar whose fill height is the precipitation probability. A bar is
 // read at a glance; "P35%" has to be parsed. Yellow fill inside a black outline -
 // yellow alone on white is 1.6:1, but the outline supplies the edge.
@@ -2478,69 +2466,80 @@ void drawPrecipitationBar(int16_t x, int16_t y, int16_t width, int16_t height, i
 }
 
 // The "modern" design: today as a hero panel on the left, the remaining four days
-// compact on the right with precipitation bars. Answers "what is it doing now"
-// without reading, which five identical cards cannot.
+// compact on the right. Answers "what is it doing now" without reading, which
+// five identical cards cannot.
+//
+// Every number carries a marker, a unit or a label. Unlabelled values are the
+// main way a dense panel becomes unreadable: "19 / 27" could be anything.
 void drawModernForecast(const ForecastData& forecast)
 {
   const uint16_t width = epaper.width();
   const uint16_t height = epaper.height();
-  constexpr int16_t kStripHeight = 14;
+  // 20 px so the strip can carry font 2. A warning is the most urgent text on the
+  // panel and was previously set in the smallest font available.
+  constexpr int16_t kStripHeight = 20;
   constexpr int16_t kHeroWidth = 112;
 
   epaper.setTextWrap(false, false);
-  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
-  // 128 px width, so in landscape it clears only the left 128 columns and leaves
-  // the rest of the previous frame behind. The classic layout hid that by
-  // repainting every pixel; any layout with white space does not.
   epaper.fillSprite(TFT_WHITE);
 
   // --- status strip ---------------------------------------------------------
-  // Yellow with black text when something is wrong, black with yellow text
-  // otherwise. Both are 9.3:1; the colour swap is the signal.
+  // Yellow with black text when something is wrong, black with yellow otherwise.
+  // Both are 9.3:1; the colour swap is itself the signal.
   const bool warn = !activeWarning.isEmpty();
   epaper.fillRect(0, 0, width, kStripHeight, warn ? TFT_YELLOW : TFT_BLACK);
   const uint16_t stripFg = warn ? TFT_BLACK : TFT_YELLOW;
   const uint16_t stripBg = warn ? TFT_YELLOW : TFT_BLACK;
-  epaper.setTextColor(stripFg, stripBg);
 
-  drawBatteryIcon(width - kBatteryIconWidth - 4, 1, currentBattery);
+  drawBatteryIcon(width - kBatteryIconWidth - 4, 3, currentBattery);
   const uint16_t stripRight = width - kBatteryIconMargin;
 
+  epaper.setTextColor(stripFg, stripBg);
   if (warn) {
-    epaper.drawString(clampTextToWidth(activeWarning, stripRight - 8, 1), 4, 3, 1);
+    epaper.drawString(clampTextToWidth(activeWarning, stripRight - 8, 2), 4, 2, 2);
   } else {
-    epaper.drawString(clampTextToWidth(forecast.location, 90, 1), 4, 3, 1);
-    const String info = showNetworkInfo
-                            ? (String(ui().labelWifi) + ": " + WiFi.localIP().toString())
-                            : buildHeaderPreset(forecast, headerMode);
-    epaper.drawRightString(clampTextToWidth(info, stripRight - 100, 1), stripRight, 3, 1);
+    const String place = showNetworkInfo ? WiFi.localIP().toString() : String(forecast.location);
+    epaper.drawString(clampTextToWidth(place, 150, 2), 4, 2, 2);
+    // The timestamp stays small: it is metadata, not weather.
+    const String stamp = String(forecast.updatedDay) + " " + forecast.updatedAt;
+    epaper.drawRightString(clampTextToWidth(stamp, stripRight - 160, 1), stripRight, 6, 1);
   }
 
   // --- hero: today ----------------------------------------------------------
   const ForecastDay& today = forecast.days[0];
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
+  epaper.drawString(ui().labelNow, 4, kStripHeight + 2, 1);
 
   const String heroTemp = forecast.currentValid ? String(forecast.currentTemp) : String(today.tempMax);
-  drawFreeFontLeft(heroTemp, 6, kStripHeight + 2, &FreeSansBold18pt7b, TFT_RED, TFT_WHITE);
+  drawFreeFontLeft(heroTemp, 4, kStripHeight + 10, &FreeSansBold18pt7b, TFT_RED, TFT_WHITE);
   epaper.setFreeFont(&FreeSansBold18pt7b);
   const uint16_t heroWidth = epaper.textWidth(heroTemp);
   epaper.setFreeFont(nullptr);
-  drawDegreeSymbol(6 + heroWidth + 5, kStripHeight + 9, 3, TFT_RED);
+  drawDegreeSymbol(4 + heroWidth + 5, kStripHeight + 17, 3, TFT_RED);
 
+  drawWeatherIcon(today, 4 + kWeatherIcon40Width / 2, kStripHeight + 38);
+
+  // High and low beside the icon, marked rather than merely coloured.
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
-  epaper.drawString(weatherLabel(today), 6, kStripHeight + 32, 1);
-  drawWeatherIcon(today, 6 + kWeatherIcon40Width / 2, kStripHeight + 44);
+  drawUpMarker(50, kStripHeight + 44, TFT_RED);
+  epaper.drawString(String(today.tempMax), 60, kStripHeight + 38, 2);
+  drawDownMarker(50, kStripHeight + 62, TFT_BLACK);
+  epaper.drawString(String(today.tempMin), 60, kStripHeight + 56, 2);
 
-  // High/low, then the day's rainfall in millimetres - the amount, which the
-  // classic design never shows.
-  const String range = String(today.tempMin) + " / " + String(today.tempMax);
-  epaper.drawString(range, 52, kStripHeight + 48, 1);
+  epaper.drawString(clampTextToWidth(weatherLabel(today), kHeroWidth - 8, 1), 4, kStripHeight + 78, 1);
+
+  // Rain carries its unit; sun times carry markers.
   String rain = String(forecast.precipitationMm / 10);
   if ((forecast.precipitationMm % 10) != 0) {
     rain += "." + String(forecast.precipitationMm % 10);
   }
-  epaper.drawString(rain + "mm", 52, kStripHeight + 60, 1);
-  epaper.drawString(String(forecast.sunrise) + "-" + forecast.sunset, 6, height - 10, 1);
+  // Rain and sun times need their own lines - drawing both from x=4 put the
+  // sunrise marker straight over the rainfall figure.
+  epaper.drawString(rain + "mm", 4, kStripHeight + 88, 1);
+  drawUpMarker(4, kStripHeight + 99, TFT_BLACK);
+  epaper.drawString(forecast.sunrise, 13, kStripHeight + 98, 1);
+  drawDownMarker(52, kStripHeight + 99, TFT_BLACK);
+  epaper.drawString(forecast.sunset, 61, kStripHeight + 98, 1);
 
   epaper.drawFastVLine(kHeroWidth, kStripHeight + 2, height - kStripHeight - 4, TFT_BLACK);
 
@@ -2551,16 +2550,21 @@ void drawModernForecast(const ForecastData& forecast)
     const int16_t cx = kHeroWidth + (i - 1) * columnWidth;
     const int16_t centre = cx + columnWidth / 2;
 
-    drawCenteredText(day.weekday, centre, kStripHeight + 3, 1, TFT_BLACK, TFT_WHITE);
-    drawWeatherIcon20(day, centre - 10, kStripHeight + 14);
+    drawCenteredText(day.weekday, centre, kStripHeight + 2, 1, TFT_BLACK, TFT_WHITE);
+    // Full-size art: reducing it to 20 px cost more legibility than the space was
+    // worth, and a 46 px column takes the 40 px icon with room to spare.
+    drawWeatherIcon(day, centre, kStripHeight + 12);
 
+    drawUpMarker(cx + 5, kStripHeight + 58, TFT_RED);
     epaper.setTextColor(TFT_RED, TFT_WHITE);
-    epaper.drawCentreString(String(day.tempMax), centre, kStripHeight + 37, 2);
+    epaper.drawString(String(day.tempMax), cx + 14, kStripHeight + 52, 2);
+    drawDownMarker(cx + 5, kStripHeight + 74, TFT_BLACK);
     epaper.setTextColor(TFT_BLACK, TFT_WHITE);
-    epaper.drawCentreString(String(day.tempMin), centre, kStripHeight + 55, 1);
+    epaper.drawString(String(day.tempMin), cx + 14, kStripHeight + 70, 1);
 
-    drawPrecipitationBar(centre - 9, kStripHeight + 68, 18, 22, day.precipitationProbability);
-    epaper.drawCentreString(String(day.precipitationProbability) + "%", centre, kStripHeight + 93, 1);
+    // Bar and figure side by side: stacking them spends height restating one fact.
+    drawPrecipitationBar(cx + 4, kStripHeight + 82, 12, 20, day.precipitationProbability);
+    epaper.drawString(String(day.precipitationProbability) + "%", cx + 19, kStripHeight + 88, 1);
   }
 }
 
