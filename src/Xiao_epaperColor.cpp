@@ -184,6 +184,9 @@ String headerMode2 = "sun";
 // Which element occupies the left of the banner: "temp" / "location" / "both" /
 // "info" (nothing, giving the whole width to the info lines).
 String headerLayout = "temp";
+// Which whole-panel design to draw: "classic" (five equal cards) or "modern"
+// (today as a hero, the rest compact with precipitation bars).
+String panelDesign = "classic";
 // Text of the active warning, empty when none. Recomputed on each refresh.
 String activeWarning;
 // Exactly what was last drawn on the header's first line, exposed in /status so
@@ -393,6 +396,9 @@ struct UiText
   const char* labelGust;
   const char* headerModeLabel;
   const char* headerMode2Label;
+  const char* designLabel;
+  const char* designClassic;
+  const char* designModern;
   const char* layoutLabel;
   const char* layoutTemp;
   const char* layoutLocation;
@@ -502,6 +508,9 @@ const UiText kUiText[] = {
         "gust",
         "Header line",
         "Second line",
+        "Design",
+        "Classic - five equal days",
+        "Modern - today large",
         "Layout",
         "Temperature",
         "Location",
@@ -610,6 +619,9 @@ const UiText kUiText[] = {
         "Boe",
         "Kopfzeile",
         "Zweite Zeile",
+        "Design",
+        "Klassisch - fuenf gleiche Tage",
+        "Modern - heute gross",
         "Layout",
         "Temperatur",
         "Ort",
@@ -719,6 +731,9 @@ const UiText kUiText[] = {
         "Linea superior",
         "Segunda linea",
         "Diseno",
+        "Clasico - cinco dias iguales",
+        "Moderno - hoy grande",
+        "Distribucion",
         "Temperatura",
         "Lugar",
         "Temperatura + lugar",
@@ -826,6 +841,9 @@ const UiText kUiText[] = {
         "rafale",
         "Ligne den-tete",
         "Deuxieme ligne",
+        "Design",
+        "Classique - cinq jours egaux",
+        "Moderne - aujourdhui en grand",
         "Disposition",
         "Temperature",
         "Lieu",
@@ -1547,7 +1565,9 @@ bool fetchForecast(ForecastData& forecast)
 
 // Draws a 40x40 weather icon using 4bpp palette indices from the sprite sheet.
 // The icon data targets the default Seeed_GFX 4-bit palette (white/black/red/yellow).
-void drawWeatherIcon(const ForecastDay& day, int16_t centerX, int16_t topY)
+// The 4bpp sprite for a day's conditions. Shared by the full-size and reduced
+// icon renderers so the mapping lives in one place.
+const uint8_t* weatherIconData(const ForecastDay& day)
 {
   // Icons are ordered left-to-right, top-to-bottom in the 6x3 sprite:
   // clear, mostly_clear, partly_cloudy, cloudy, fog, light_rain,
@@ -1628,11 +1648,19 @@ void drawWeatherIcon(const ForecastDay& day, int16_t centerX, int16_t topY)
       break;
   }
 
+  return kWeatherIcon40[iconIndex];
+}
+
+void drawWeatherIcon(const ForecastDay& day, int16_t centerX, int16_t topY)
+{
+  const uint8_t* icon = weatherIconData(day);
+  if (icon == nullptr) {
+    return;
+  }
   const int16_t x = centerX - (kWeatherIcon40Width / 2);
   // Keep a white icon background so the glyphs remain visible.
   epaper.fillRect(x, topY, kWeatherIcon40Width, kWeatherIcon40Height, TFT_WHITE);
   // Icon data is 4bpp palette indices. Push into the 4bpp e-paper sprite.
-  const uint8_t* icon = kWeatherIcon40[iconIndex];
   epaper.pushImage(
       x,
       topY,
@@ -1812,7 +1840,11 @@ void renderSetupScreen(const String& title, const String& line1, const String& l
   }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
-  epaper.fillScreen(TFT_WHITE);
+  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
+  // 128 px width, so in landscape it clears only the left 128 columns and leaves
+  // the rest of the previous frame behind. The classic layout hid that by
+  // repainting every pixel; any layout with white space does not.
+  epaper.fillSprite(TFT_WHITE);
   epaper.fillRect(0, 0, epaper.width(), 24, TFT_RED);
   epaper.setTextColor(TFT_WHITE, TFT_RED);
   epaper.drawString(title, 6, 4, 2);
@@ -2284,7 +2316,9 @@ void renderHeader(const ForecastData& forecast)
   // A low pack gets a red strip along the bottom of the banner - visible at a
   // glance from across the room, unlike the small percentage in the glyph.
   if (batteryIsLow()) {
-    epaper.fillRect(0, kHeaderHeight - 3, displayWidth, 2, TFT_RED);
+    // Yellow, not red: red on black is 2.7:1 and barely registers, while yellow
+    // on black is 9.3:1 and reads as "attention" anyway.
+    epaper.fillRect(0, kHeaderHeight - 3, displayWidth, 2, TFT_YELLOW);
   }
 
   // The battery glyph owns the far right of the banner; both text lines stop
@@ -2305,6 +2339,7 @@ void renderHeader(const ForecastData& forecast)
   // after a power cut is the cheaper trade.
   String headerLine;
   uint16_t headerColor = TFT_YELLOW;
+  bool warningBar = false;
   if (showNetworkInfo) {
     const String wifiName = currentSsid.isEmpty() ? String("AP") : currentSsid;
     const String ipText =
@@ -2312,7 +2347,10 @@ void renderHeader(const ForecastData& forecast)
     headerLine = String(ui().labelWifi) + ": " + wifiName + " " + ipText;
   } else if (!activeWarning.isEmpty()) {
     headerLine = activeWarning;
-    headerColor = TFT_RED;
+    // Drawn as black on a yellow bar below, not as coloured text: red on black
+    // measures 2.7:1, which fails even the large-text bar, while black on yellow
+    // is 9.3:1 and is what a caution strip looks like everywhere else.
+    warningBar = true;
   } else {
     headerLine = buildHeaderPreset(forecast, headerMode);
   }
@@ -2322,8 +2360,17 @@ void renderHeader(const ForecastData& forecast)
   const uint16_t maxWidth = (textRightEdge > leftWidth + 12) ? (textRightEdge - leftWidth - 12) : 0;
 
   lastHeaderLine = headerLine;
-  epaper.setTextColor(headerColor, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(headerLine, maxWidth, 1), textRightEdge, 0, 1);
+  const String clampedLine = clampTextToWidth(headerLine, maxWidth, 1);
+  if (warningBar && !clampedLine.isEmpty()) {
+    // A filled bar sized to the text, so the warning reads as a caution strip
+    // rather than as another line of status text.
+    const uint16_t barWidth = epaper.textWidth(clampedLine, 1) + 6;
+    epaper.fillRect(textRightEdge - barWidth, 0, barWidth + 2, 9, TFT_YELLOW);
+    epaper.setTextColor(TFT_BLACK, TFT_YELLOW);
+  } else {
+    epaper.setTextColor(headerColor, TFT_BLACK);
+  }
+  epaper.drawRightString(clampedLine, textRightEdge - 2, 0, 1);
 
   // Line 2: the second preset, independent of the first. "off" leaves it blank
   // rather than drawing a stale value.
@@ -2355,7 +2402,9 @@ void renderDayCard(const ForecastDay& day, uint16_t x, uint16_t y, uint16_t widt
   const uint16_t labelY = y + 53;
   const uint16_t tempY = y + 70;
 
-  epaper.drawFastHLine(x, dividerY, width, TFT_YELLOW);
+  // Black, not yellow: yellow on white measures 1.6:1, so the old divider was
+  // ink spent on something nobody could see.
+  epaper.drawFastHLine(x, dividerY, width, TFT_BLACK);
   drawCenteredText(day.weekday, x + width / 2, y + 2, 2, TFT_BLACK, TFT_WHITE);
   drawWeatherIcon(day, x + width / 2, iconTop);
 
@@ -2381,6 +2430,140 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
 }
 
 // Full-screen forecast render. This redraws the full frame (not partial refresh).
+// Half-size icon, produced by box-reducing the 40x40 art rather than shipping a
+// second icon set. Each 2x2 source block collapses to one pixel, preferring any
+// non-white pixel in the block so thin outlines survive the reduction - plain
+// nearest-neighbour drops them and the glyph falls apart at 20 px.
+void drawWeatherIcon20(const ForecastDay& day, int16_t x, int16_t y)
+{
+  const uint8_t* icon = weatherIconData(day);
+  if (icon == nullptr) {
+    return;
+  }
+  constexpr int16_t kSrc = kWeatherIcon40Width;
+  for (int16_t oy = 0; oy < kSrc / 2; ++oy) {
+    for (int16_t ox = 0; ox < kSrc / 2; ++ox) {
+      uint8_t chosen = 0x00;  // white
+      for (int16_t dy = 0; dy < 2; ++dy) {
+        for (int16_t dx = 0; dx < 2; ++dx) {
+          const int32_t index = (oy * 2 + dy) * kSrc + (ox * 2 + dx);
+          const uint8_t byte = pgm_read_byte(&icon[index / 2]);
+          const uint8_t value = (index & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+          if (value != 0x00) {
+            chosen = value;
+          }
+        }
+      }
+      if (chosen != 0x00) {
+        epaper.drawPixel(x + ox, y + oy, chosen);
+      }
+    }
+  }
+}
+
+// A vertical bar whose fill height is the precipitation probability. A bar is
+// read at a glance; "P35%" has to be parsed. Yellow fill inside a black outline -
+// yellow alone on white is 1.6:1, but the outline supplies the edge.
+void drawPrecipitationBar(int16_t x, int16_t y, int16_t width, int16_t height, int percent)
+{
+  epaper.drawRect(x, y, width, height, TFT_BLACK);
+  const int16_t inner = height - 2;
+  int16_t filled = (inner * constrain(percent, 0, 100)) / 100;
+  if (percent > 0 && filled < 1) {
+    filled = 1;  // never render a non-zero chance as empty
+  }
+  if (filled > 0) {
+    epaper.fillRect(x + 1, y + height - 1 - filled, width - 2, filled, TFT_YELLOW);
+  }
+}
+
+// The "modern" design: today as a hero panel on the left, the remaining four days
+// compact on the right with precipitation bars. Answers "what is it doing now"
+// without reading, which five identical cards cannot.
+void drawModernForecast(const ForecastData& forecast)
+{
+  const uint16_t width = epaper.width();
+  const uint16_t height = epaper.height();
+  constexpr int16_t kStripHeight = 14;
+  constexpr int16_t kHeroWidth = 112;
+
+  epaper.setTextWrap(false, false);
+  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
+  // 128 px width, so in landscape it clears only the left 128 columns and leaves
+  // the rest of the previous frame behind. The classic layout hid that by
+  // repainting every pixel; any layout with white space does not.
+  epaper.fillSprite(TFT_WHITE);
+
+  // --- status strip ---------------------------------------------------------
+  // Yellow with black text when something is wrong, black with yellow text
+  // otherwise. Both are 9.3:1; the colour swap is the signal.
+  const bool warn = !activeWarning.isEmpty();
+  epaper.fillRect(0, 0, width, kStripHeight, warn ? TFT_YELLOW : TFT_BLACK);
+  const uint16_t stripFg = warn ? TFT_BLACK : TFT_YELLOW;
+  const uint16_t stripBg = warn ? TFT_YELLOW : TFT_BLACK;
+  epaper.setTextColor(stripFg, stripBg);
+
+  drawBatteryIcon(width - kBatteryIconWidth - 4, 1, currentBattery);
+  const uint16_t stripRight = width - kBatteryIconMargin;
+
+  if (warn) {
+    epaper.drawString(clampTextToWidth(activeWarning, stripRight - 8, 1), 4, 3, 1);
+  } else {
+    epaper.drawString(clampTextToWidth(forecast.location, 90, 1), 4, 3, 1);
+    const String info = showNetworkInfo
+                            ? (String(ui().labelWifi) + ": " + WiFi.localIP().toString())
+                            : buildHeaderPreset(forecast, headerMode);
+    epaper.drawRightString(clampTextToWidth(info, stripRight - 100, 1), stripRight, 3, 1);
+  }
+
+  // --- hero: today ----------------------------------------------------------
+  const ForecastDay& today = forecast.days[0];
+  epaper.setTextColor(TFT_BLACK, TFT_WHITE);
+
+  const String heroTemp = forecast.currentValid ? String(forecast.currentTemp) : String(today.tempMax);
+  drawFreeFontLeft(heroTemp, 6, kStripHeight + 2, &FreeSansBold18pt7b, TFT_RED, TFT_WHITE);
+  epaper.setFreeFont(&FreeSansBold18pt7b);
+  const uint16_t heroWidth = epaper.textWidth(heroTemp);
+  epaper.setFreeFont(nullptr);
+  drawDegreeSymbol(6 + heroWidth + 5, kStripHeight + 9, 3, TFT_RED);
+
+  epaper.setTextColor(TFT_BLACK, TFT_WHITE);
+  epaper.drawString(weatherLabel(today), 6, kStripHeight + 32, 1);
+  drawWeatherIcon(today, 6 + kWeatherIcon40Width / 2, kStripHeight + 44);
+
+  // High/low, then the day's rainfall in millimetres - the amount, which the
+  // classic design never shows.
+  const String range = String(today.tempMin) + " / " + String(today.tempMax);
+  epaper.drawString(range, 52, kStripHeight + 48, 1);
+  String rain = String(forecast.precipitationMm / 10);
+  if ((forecast.precipitationMm % 10) != 0) {
+    rain += "." + String(forecast.precipitationMm % 10);
+  }
+  epaper.drawString(rain + "mm", 52, kStripHeight + 60, 1);
+  epaper.drawString(String(forecast.sunrise) + "-" + forecast.sunset, 6, height - 10, 1);
+
+  epaper.drawFastVLine(kHeroWidth, kStripHeight + 2, height - kStripHeight - 4, TFT_BLACK);
+
+  // --- the next four days ---------------------------------------------------
+  const int16_t columnWidth = (width - kHeroWidth) / 4;
+  for (uint8_t i = 1; i < kForecastDays; ++i) {
+    const ForecastDay& day = forecast.days[i];
+    const int16_t cx = kHeroWidth + (i - 1) * columnWidth;
+    const int16_t centre = cx + columnWidth / 2;
+
+    drawCenteredText(day.weekday, centre, kStripHeight + 3, 1, TFT_BLACK, TFT_WHITE);
+    drawWeatherIcon20(day, centre - 10, kStripHeight + 14);
+
+    epaper.setTextColor(TFT_RED, TFT_WHITE);
+    epaper.drawCentreString(String(day.tempMax), centre, kStripHeight + 37, 2);
+    epaper.setTextColor(TFT_BLACK, TFT_WHITE);
+    epaper.drawCentreString(String(day.tempMin), centre, kStripHeight + 55, 1);
+
+    drawPrecipitationBar(centre - 9, kStripHeight + 68, 18, 22, day.precipitationProbability);
+    epaper.drawCentreString(String(day.precipitationProbability) + "%", centre, kStripHeight + 93, 1);
+  }
+}
+
 // Draw the whole frame into the sprite without pushing it to the panel.
 //
 // This split is what makes a live preview possible: everything here is RAM work
@@ -2393,10 +2576,18 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
 void drawForecastToBuffer(const ForecastData& forecast)
 {
   epaper.setRotation(1);
+  if (panelDesign == "modern") {
+    drawModernForecast(forecast);
+    return;
+  }
   epaper.setTextWrap(false, false);
   const uint16_t displayWidth = epaper.width();
   const uint16_t displayHeight = epaper.height();
-  epaper.fillScreen(TFT_WHITE);
+  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
+  // 128 px width, so in landscape it clears only the left 128 columns and leaves
+  // the rest of the previous frame behind. The classic layout hid that by
+  // repainting every pixel; any layout with white space does not.
+  epaper.fillSprite(TFT_WHITE);
   renderHeader(forecast);
 
   // No gap: the banner runs right down to the cards, and its rule is the divider.
@@ -2430,7 +2621,11 @@ void renderErrorScreen(const String& title, const String& detail)
   }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
-  epaper.fillScreen(TFT_WHITE);
+  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
+  // 128 px width, so in landscape it clears only the left 128 columns and leaves
+  // the rest of the previous frame behind. The classic layout hid that by
+  // repainting every pixel; any layout with white space does not.
+  epaper.fillSprite(TFT_WHITE);
   epaper.fillRect(0, 0, epaper.width(), 22, TFT_RED);
   epaper.setTextColor(TFT_WHITE, TFT_RED);
   epaper.drawString("WEATHER ERROR", 6, 3, 2);
@@ -2651,6 +2846,11 @@ bool isHeaderLayoutSupported(const String& layout)
   return layout == "temp" || layout == "location" || layout == "both" || layout == "info";
 }
 
+bool isPanelDesignSupported(const String& design)
+{
+  return design == "classic" || design == "modern";
+}
+
 void loadHeaderPreference()
 {
   if (!preferences.begin(kPrefsNamespace, false)) {
@@ -2660,6 +2860,7 @@ void loadHeaderPreference()
   const String stored = preferences.getString("hdr_mode", "now");
   const String stored2 = preferences.getString("hdr_mode2", "sun");
   const String storedLayout = preferences.getString("layout", "temp");
+  const String storedDesign = preferences.getString("design", "classic");
   preferences.end();
   if (isHeaderModeSupported(stored)) {
     headerMode = stored;
@@ -2669,6 +2870,9 @@ void loadHeaderPreference()
   }
   if (isHeaderLayoutSupported(storedLayout)) {
     headerLayout = storedLayout;
+  }
+  if (isPanelDesignSupported(storedDesign)) {
+    panelDesign = storedDesign;
   }
 }
 
@@ -2692,6 +2896,17 @@ void saveHeaderMode2Preference(const String& mode)
   preferences.putString("hdr_mode2", mode);
   preferences.end();
   headerMode2 = mode;
+}
+
+void savePanelDesignPreference(const String& design)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving panel design.");
+    return;
+  }
+  preferences.putString("design", design);
+  preferences.end();
+  panelDesign = design;
 }
 
 void saveHeaderLayoutPreference(const String& layout)
@@ -3494,7 +3709,9 @@ String buildStatusJson()
   json += activeWarning.isEmpty() ? "false" : "true";
   json += ",\"showNetworkInfo\":";
   json += showNetworkInfo ? "true" : "false";
-  json += ",\"layout\":\"";
+  json += ",\"design\":\"";
+  json += jsonEscape(panelDesign);
+  json += "\",\"layout\":\"";
   json += jsonEscape(headerLayout);
   json += "\",\"headerMode2\":\"";
   json += jsonEscape(headerMode2);
@@ -3592,7 +3809,7 @@ String buildMainPage()
   const UiText& t = ui();
   String page = R"rawliteral(
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{LANG}}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -3675,13 +3892,16 @@ String buildMainPage()
     h1 {
       font-size: 1.5em; margin: 6px 0;
       color: var(--card-title-color);
-      text-shadow: var(--card-title-glow);
+      /* No glow behind title text: haze around glyphs costs legibility. */
     }
     #summary { font-size: 0.85em; margin-top: 2px; }
     .header-right { display: flex; align-items: center; gap: 12px; }
     .lang-row select { padding: 6px 10px; border: 1px solid var(--input-border); border-radius: 4px; background: var(--input-bg); color: var(--input-text); font-size: 13px; }
     .switch { position: relative; display: inline-block; width: 34px; height: 20px; }
-    .switch input { display: none; }
+    /* Visually hidden, but still focusable: display:none took these out of the
+       tab order, making every toggle on the page mouse-only. */
+    .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+    .switch input:focus-visible + .slider { outline: 3px solid var(--switch-on); outline-offset: 2px; }
     .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: var(--switch-off); transition: .3s; border-radius: 10px; }
     .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: var(--switch-thumb); transition: .3s; border-radius: 50%; }
     input:checked + .slider { background: var(--switch-on); }
@@ -3708,7 +3928,7 @@ String buildMainPage()
     .card-title {
       font-size: 20px; margin: 0 0 12px 0;
       color: var(--card-title-color);
-      text-shadow: var(--card-title-glow);
+      /* No glow behind title text: haze around glyphs costs legibility. */
     }
     .card-group-title {
       font-size: 16px; margin: 14px 0 6px;
@@ -3719,7 +3939,7 @@ String buildMainPage()
     .info-item {
       display: flex; justify-content: space-between; align-items: center;
       padding: 8px; background: var(--info-bg); border-radius: 5px;
-      font-size: 12px; color: var(--info-text);
+      font-size: 0.9rem; color: var(--info-text);
     }
     .info-label { font-weight: bold; }
     .info-value { font-family: monospace; }
@@ -3742,7 +3962,8 @@ String buildMainPage()
     }
     /* 128x296 buffer rotated a quarter turn into the 296x128 view the panel shows. */
     .panel-preview {
-      height: 128px; display: flex; align-items: center; justify-content: center;
+      /* Scaled up: at 1:1 the 296x128 panel is unreadably small on a phone. */
+      height: 192px; display: flex; align-items: center; justify-content: center;
       overflow: hidden; margin: 10px 0;
       border: 1px solid var(--input-border); border-radius: 4px; background: #fff;
     }
@@ -3750,7 +3971,7 @@ String buildMainPage()
       /* The buffer is portrait and its first row is the panel's right edge, so
          the quarter turn is anticlockwise. Turning it the other way renders the
          preview upside down. */
-      transform: rotate(-90deg);
+      transform: rotate(-90deg) scale(1.5);
       image-rendering: pixelated;
       max-width: none;
     }
@@ -3812,7 +4033,7 @@ String buildMainPage()
         <select id="language">{{LANGUAGE_OPTIONS}}</select>
       </div>
       <label class="switch" title="Dark mode">
-        <input type="checkbox" id="darkToggle">
+        <input type="checkbox" id="darkToggle" aria-label="Dark mode">
         <span class="slider"></span>
       </label>
     </div>
@@ -3824,7 +4045,7 @@ String buildMainPage()
       <div class="sleep-row">
         <span>{{SLEEP_MODE_LABEL}}</span>
         <label class="switch" title="{{SLEEP_MODE_LABEL}}">
-          <input type="checkbox" id="sleepToggle">
+          <input type="checkbox" id="sleepToggle" aria-label="{{SLEEP_MODE_LABEL}}">
           <span class="slider"></span>
         </label>
       </div>
@@ -3894,7 +4115,7 @@ String buildMainPage()
       </select>
       <div class="sleep-row">
         <span>{{QUIET_HOURS_LABEL}}</span>
-        <label class="switch"><input type="checkbox" id="quietEnabled"><span class="slider"></span></label>
+        <label class="switch"><input type="checkbox" id="quietEnabled" aria-label="{{QUIET_HOURS_LABEL}}"><span class="slider"></span></label>
       </div>
       <label for="quietStart">{{QUIET_FROM_LABEL}}</label>
       <input type="number" id="quietStart" min="0" max="23">
@@ -3904,7 +4125,7 @@ String buildMainPage()
       <select id="batteryPack">{{BATTERY_PACK_OPTIONS}}</select>
       <div class="sleep-row">
         <span>{{BATTERY_WARN_LABEL}}</span>
-        <label class="switch"><input type="checkbox" id="batteryWarnEnabled"><span class="slider"></span></label>
+        <label class="switch"><input type="checkbox" id="batteryWarnEnabled" aria-label="{{BATTERY_WARN_LABEL}}"><span class="slider"></span></label>
       </div>
       <input type="number" id="batteryWarnPercent" min="0" max="100">
       <div class="button-row" style="grid-template-columns:1fr">
@@ -3924,8 +4145,13 @@ String buildMainPage()
       <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
       <!-- The framebuffer is the panel's native portrait 128x296; rotating here
            avoids second-guessing the sprite's coordinate mapping on the device. -->
-      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="panel"></div>
+      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="{{PREVIEW_TITLE}}"></div>
       <div id="previewNote" class="sleep-hint"></div>
+      <label for="design">{{DESIGN_LABEL}}</label>
+      <select id="design">
+        <option value="classic">{{DESIGN_CLASSIC}}</option>
+        <option value="modern">{{DESIGN_MODERN}}</option>
+      </select>
       <label for="layout">{{LAYOUT_LABEL}}</label>
       <select id="layout">
         <option value="temp">{{LAYOUT_TEMP}}</option>
@@ -4007,7 +4233,11 @@ String buildMainPage()
     // Dark mode
     (function() {
       const toggle = document.getElementById('darkToggle');
-      if (localStorage.getItem('darkMode') === '1') {
+      const stored = localStorage.getItem('darkMode');
+      // No stored choice: follow the operating system rather than assuming light.
+      const prefersDark = stored === null &&
+        window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (stored === '1' || prefersDark) {
         document.body.classList.add('dark-mode');
         toggle.checked = true;
       }
@@ -4021,8 +4251,16 @@ String buildMainPage()
       if (!response.ok) throw new Error(await response.text());
       return response.json();
     }
-    function makeInfoItem(label, value) {
-      return `<div class="info-item"><span class="info-label">${label}</span><span class="info-value">${value}</span></div>`;
+    // Escape anything that came from the device before it reaches innerHTML.
+    // Network names are attacker-chosen: an access point called
+    // <img src=x onerror=...> would otherwise execute when the status card renders.
+    function esc(v) {
+      return String(v == null ? '' : v).replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function makeInfoItem(label, value, isHtml) {
+      const shown = isHtml ? value : esc(value);
+      return `<div class="info-item"><span class="info-label">${esc(label)}</span><span class="info-value">${shown}</span></div>`;
     }
     // Battery meter mirroring the e-paper glyph: outline plus a proportional fill.
     function makeBatteryValue(status) {
@@ -4071,7 +4309,7 @@ String buildMainPage()
         makeInfoItem(ui.statusReason, status.disconnectReason || '-') +
         makeInfoItem(ui.statusForecast, status.forecastValid ? ui.forecastValid : ui.forecastMissing) +
         makeInfoItem(ui.statusUpdated, status.updated || '-') +
-        makeInfoItem(ui.statusBattery, makeBatteryValue(status)) +
+        makeInfoItem(ui.statusBattery, makeBatteryValue(status), true) +
         makeInfoItem(ui.statusSleepIn, status.deepSleepEnabled ? `${status.awakeSecondsLeft}s` : '-');
       // Populate the settings inputs ONCE. The poll runs every 8 s, and checking
       // only document.activeElement was not enough: as soon as focus left a
@@ -4089,6 +4327,7 @@ String buildMainPage()
       setIfIdle('lat', status.latitude);
       setIfIdle('lon', status.longitude);
       setIfIdle('timezone', status.timezone);
+      setIfIdle('design', status.design);
       setIfIdle('layout', status.layout);
       setIfIdle('headerMode', status.headerMode);
       setIfIdle('headerMode2', status.headerMode2);
@@ -4227,6 +4466,10 @@ String buildMainPage()
           mph: document.getElementById('unitWind').value === 'mph'
         })
       });
+      await fetch('/design', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({design: document.getElementById('design').value})
+      });
       await fetch('/layout', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({layout: document.getElementById('layout').value})
@@ -4277,6 +4520,7 @@ String buildMainPage()
     // its buffer and hands back an image; the display itself is never touched.
     function previewSettings() {
       const q = new URLSearchParams({
+        design: document.getElementById('design').value,
         layout: document.getElementById('layout').value,
         mode: document.getElementById('headerMode').value,
         mode2: document.getElementById('headerMode2').value,
@@ -4287,7 +4531,7 @@ String buildMainPage()
       const note = document.getElementById('previewNote');
       if (note) { note.textContent = ui.previewUnsaved; }
     }
-    ['layout', 'headerMode', 'headerMode2'].forEach(id => {
+    ['design', 'layout', 'headerMode', 'headerMode2'].forEach(id => {
       document.getElementById(id).addEventListener('change', previewSettings);
     });
     document.getElementById('locLabel').addEventListener('change', previewSettings);
@@ -4325,13 +4569,34 @@ String buildMainPage()
       }
     });
     scanNetworks().then(updateStatus).then(updateLogs);
-    setInterval(updateStatus, 8000);
-    setInterval(updateLogs, 5000);
+    // Only poll while the page is actually visible. A backgrounded tab was
+    // costing mobile battery and, worse, holding the device awake: every request
+    // extends its awake window, so a forgotten tab kept it out of deep sleep up
+    // to the 10-minute cap.
+    let statusTimer = null;
+    let logsTimer = null;
+    function startPolling() {
+      if (statusTimer === null) { statusTimer = setInterval(updateStatus, 8000); }
+      if (logsTimer === null) { logsTimer = setInterval(updateLogs, 5000); }
+    }
+    function stopPolling() {
+      clearInterval(statusTimer); statusTimer = null;
+      clearInterval(logsTimer); logsTimer = null;
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopPolling();
+      } else {
+        updateStatus(); updateLogs(); startPolling();
+      }
+    });
+    startPolling();
   </script>
 </body>
 </html>
 )rawliteral";
 
+  page.replace("{{LANG}}", kUiText[static_cast<uint8_t>(currentLanguage)].code);
   page.replace("{{TITLE}}", t.title);
   page.replace("{{LOADING_STATE}}", t.loadingState);
   page.replace("{{STATUS_TITLE}}", t.statusTitle);
@@ -4344,6 +4609,9 @@ String buildMainPage()
   page.replace("{{WARNING_SOURCE_LABEL}}", t.warningSourceLabel);
   page.replace("{{HEADER_MODE_LABEL}}", t.headerModeLabel);
   page.replace("{{HEADER_MODE2_LABEL}}", t.headerMode2Label);
+  page.replace("{{DESIGN_LABEL}}", t.designLabel);
+  page.replace("{{DESIGN_CLASSIC}}", t.designClassic);
+  page.replace("{{DESIGN_MODERN}}", t.designModern);
   page.replace("{{LAYOUT_LABEL}}", t.layoutLabel);
   page.replace("{{LAYOUT_TEMP}}", t.layoutTemp);
   page.replace("{{LAYOUT_LOCATION}}", t.layoutLocation);
@@ -4458,7 +4726,7 @@ String buildCaptivePage()
   const UiText& t = ui();
   String page = R"rawliteral(
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{LANG}}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -4570,6 +4838,7 @@ String buildCaptivePage()
   page.replace("{{OPEN_FULL}}", t.openFull);
   page.replace("{{ACCESS_POINT}}", t.accessPoint);
   page.replace("{{DEVICE_IP}}", t.deviceIp);
+  page.replace("{{LANG}}", kUiText[static_cast<uint8_t>(currentLanguage)].code);
   page.replace("{{LANGUAGE_LABEL}}", t.languageLabel);
   page.replace("{{LANGUAGE_OPTIONS}}", buildLanguageOptions());
   page.replace("{{AP_SSID}}", kApSsid);
@@ -5125,6 +5394,26 @@ void handleBatteryPack()
   server.send(200, "text/plain", String("Battery size set to ") + batteryPackMah + " mAh.");
 }
 
+void handleDesign()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const String design = doc["design"].as<String>();
+  if (!isPanelDesignSupported(design)) {
+    server.send(400, "text/plain", "Unsupported design");
+    return;
+  }
+
+  savePanelDesignPreference(design);
+  addLog(String("Panel design set to ") + design + ".");
+  server.send(200, "text/plain", String("Design set to ") + design + ".");
+  requestRefresh();
+}
+
 void handleLayout()
 {
   noteWebActivity();
@@ -5229,6 +5518,7 @@ void handlePreviewBitmap()
 {
   noteWebActivity();
 #ifdef EPAPER_ENABLE
+  const String savedDesign = panelDesign;
   const String savedLayout = headerLayout;
   const String savedMode = headerMode;
   const String savedMode2 = headerMode2;
@@ -5237,6 +5527,9 @@ void handlePreviewBitmap()
 
   // Unrecognised values fall back to what is stored rather than erroring: a
   // preview should always render something.
+  if (server.hasArg("design") && isPanelDesignSupported(server.arg("design"))) {
+    panelDesign = server.arg("design");
+  }
   if (server.hasArg("layout") && isHeaderLayoutSupported(server.arg("layout"))) {
     headerLayout = server.arg("layout");
   }
@@ -5260,6 +5553,7 @@ void handlePreviewBitmap()
   drawForecastToBuffer(currentForecast);
   sendPanelBitmap();
 
+  panelDesign = savedDesign;
   headerLayout = savedLayout;
   headerMode = savedMode;
   headerMode2 = savedMode2;
@@ -5379,6 +5673,7 @@ void setupWebServer()
   server.on("/warningSource", HTTP_POST, handleWarningSource);
   server.on("/headerMode", HTTP_POST, handleHeaderMode);
   server.on("/layout", HTTP_POST, handleLayout);
+  server.on("/design", HTTP_POST, handleDesign);
   server.on("/batteryPack", HTTP_POST, handleBatteryPack);
   server.on("/keepAwake", HTTP_POST, handleKeepAwake);
   server.on("/panel.bmp", HTTP_GET, handlePanelBitmap);
