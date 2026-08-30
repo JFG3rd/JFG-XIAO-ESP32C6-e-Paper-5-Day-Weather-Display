@@ -172,6 +172,9 @@ bool batteryIsLow();
 // Defined with the other text helpers; the alert fetcher above it needs to fold
 // API text to ASCII before it reaches the panel.
 String toDisplayAscii(const String& text);
+// Defined with the drawing helpers; the render functions above it need to clear
+// the frame before drawing.
+void clearPanel();
 
 // Where header warnings come from: "off", "derived" (our own thresholds on the
 // forecast we already fetch) or "dwd" (official DWD alerts via Bright Sky).
@@ -1845,11 +1848,7 @@ void renderSetupScreen(const String& title, const String& line1, const String& l
   }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
-  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
-  // 128 px width, so in landscape it clears only the left 128 columns and leaves
-  // the rest of the previous frame behind. The classic layout hid that by
-  // repainting every pixel; any layout with white space does not.
-  epaper.fillSprite(TFT_WHITE);
+  clearPanel();
   epaper.fillRect(0, 0, epaper.width(), 24, TFT_RED);
   epaper.setTextColor(TFT_WHITE, TFT_RED);
   epaper.drawString(title, 6, 4, 2);
@@ -2175,6 +2174,22 @@ String batteryVoltsText(const BatteryStatus& battery)
   return String(battery.volts, 2);
 }
 
+// Clear the whole frame.
+//
+// Neither fillScreen() nor fillSprite() can be trusted here. fillScreen() is
+// bounded by the sprite's unrotated 128 px width, and fillSprite() memsets
+// (_iwidth * _yHeight) >> 1 bytes - where _yHeight is the *rotated* height, so
+// under rotation it clears 128x128 of a 128x296 buffer, under half of it.
+// Measured: with either of them, stale pixels survive from landscape column 128
+// onwards. fillRect goes through the normal rotation-aware drawing path.
+//
+// The classic layout hid this for the life of the project because its header and
+// cards repaint every pixel; any layout with white space exposes it immediately.
+void clearPanel()
+{
+  epaper.fillRect(0, 0, epaper.width(), epaper.height(), TFT_WHITE);
+}
+
 // Up and down markers. Triangles are the one glyph shape that stays unambiguous
 // at this size - a droplet or thermometer at 6 px is a blob.
 void drawUpMarker(int16_t x, int16_t y, uint16_t color)
@@ -2481,7 +2496,7 @@ void drawModernForecast(const ForecastData& forecast)
   constexpr int16_t kHeroWidth = 112;
 
   epaper.setTextWrap(false, false);
-  epaper.fillSprite(TFT_WHITE);
+  clearPanel();
 
   // --- status strip ---------------------------------------------------------
   // Yellow with black text when something is wrong, black with yellow otherwise.
@@ -2587,11 +2602,7 @@ void drawForecastToBuffer(const ForecastData& forecast)
   epaper.setTextWrap(false, false);
   const uint16_t displayWidth = epaper.width();
   const uint16_t displayHeight = epaper.height();
-  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
-  // 128 px width, so in landscape it clears only the left 128 columns and leaves
-  // the rest of the previous frame behind. The classic layout hid that by
-  // repainting every pixel; any layout with white space does not.
-  epaper.fillSprite(TFT_WHITE);
+  clearPanel();
   renderHeader(forecast);
 
   // No gap: the banner runs right down to the cards, and its rule is the divider.
@@ -2625,11 +2636,7 @@ void renderErrorScreen(const String& title, const String& detail)
   }
   epaper.setRotation(1);
   epaper.setTextWrap(false, false);
-  // fillSprite, not fillScreen: fillScreen is bounded by the sprite's unrotated
-  // 128 px width, so in landscape it clears only the left 128 columns and leaves
-  // the rest of the previous frame behind. The classic layout hid that by
-  // repainting every pixel; any layout with white space does not.
-  epaper.fillSprite(TFT_WHITE);
+  clearPanel();
   epaper.fillRect(0, 0, epaper.width(), 22, TFT_RED);
   epaper.setTextColor(TFT_WHITE, TFT_RED);
   epaper.drawString("WEATHER ERROR", 6, 3, 2);
