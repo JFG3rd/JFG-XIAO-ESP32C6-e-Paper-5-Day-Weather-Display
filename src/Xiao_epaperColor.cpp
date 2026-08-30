@@ -2489,6 +2489,34 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
 }
 
 // Full-screen forecast render. This redraws the full frame (not partial refresh).
+// Draw a weather icon enlarged by an integer factor.
+//
+// Integer scaling only: doubling maps one source pixel to an exact 2x2 block, so
+// edges stay sharp and the four panel colours stay solid. A fractional factor
+// would spread some source pixels over two output pixels and others over one,
+// which on a 4-colour panel with no anti-aliasing reads as a wobble in the
+// outline. Scaling cannot add detail - it can only avoid destroying what is there.
+void drawWeatherIconScaled(const ForecastDay& day, int16_t x, int16_t y, uint8_t scale)
+{
+  const uint8_t* icon = weatherIconData(day);
+  if (icon == nullptr) {
+    return;
+  }
+  constexpr int16_t kSrc = kWeatherIcon40Width;
+  epaper.fillRect(x, y, kSrc * scale, kWeatherIcon40Height * scale, TFT_WHITE);
+  for (int16_t sy = 0; sy < kWeatherIcon40Height; ++sy) {
+    for (int16_t sx = 0; sx < kSrc; ++sx) {
+      const int32_t index = sy * kSrc + sx;
+      const uint8_t byte = pgm_read_byte(&icon[index / 2]);
+      const uint8_t value = (index & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+      if (value == 0x00) {
+        continue;  // white: already cleared
+      }
+      epaper.fillRect(x + sx * scale, y + sy * scale, scale, scale, value);
+    }
+  }
+}
+
 // A vertical bar whose fill height is the precipitation probability. A bar is
 // read at a glance; "P35%" has to be parsed. Yellow fill inside a black outline -
 // yellow alone on white is 1.6:1, but the outline supplies the edge.
@@ -2518,7 +2546,9 @@ void drawModernForecast(const ForecastData& forecast)
   // 20 px so the strip can carry font 2. A warning is the most urgent text on the
   // panel and was previously set in the smallest font available.
   constexpr int16_t kStripHeight = 20;
-  constexpr int16_t kHeroWidth = 112;
+  // 128 wide so the hero icon can be an exact 2x (80 px) with the temperatures
+  // beside it. The day columns keep 42 px each, which still takes a 40 px icon.
+  constexpr int16_t kHeroWidth = 128;
 
   epaper.setTextWrap(false, false);
   clearPanel();
@@ -2550,23 +2580,32 @@ void drawModernForecast(const ForecastData& forecast)
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
   epaper.drawString(ui().labelNow, 4, kStripHeight + 2, 1);
 
+  // Numbers stack down the narrow left edge; the icon takes the wide half. The
+  // temperatures need ~40 px whatever happens, so giving them the wide side and
+  // the icon the narrow one wasted the space on the element that could not use it.
+  // Icon first: it paints a white background, so drawing it after the temperature
+  // would erase the degree ring sitting next to it.
+  drawWeatherIconScaled(today, 48, kStripHeight + 4, 2);
+
   const String heroTemp = forecast.currentValid ? String(forecast.currentTemp) : String(today.tempMax);
-  drawFreeFontLeft(heroTemp, 4, kStripHeight + 10, &FreeSansBold18pt7b, TFT_RED, TFT_WHITE);
-  epaper.setFreeFont(&FreeSansBold18pt7b);
+  // Three characters at 18 pt would reach past x=48 and collide with the icon -
+  // "100" is ordinary in Fahrenheit, and a sub-zero "-5" is wider than it looks.
+  // Step down a size rather than let the number and the icon overlap.
+  const GFXfont* heroFont = (heroTemp.length() >= 3) ? &FreeSansBold12pt7b : &FreeSansBold18pt7b;
+  const int16_t heroY = (heroTemp.length() >= 3) ? (kStripHeight + 16) : (kStripHeight + 10);
+  drawFreeFontLeft(heroTemp, 4, heroY, heroFont, TFT_RED, TFT_WHITE);
+  epaper.setFreeFont(heroFont);
   const uint16_t heroWidth = epaper.textWidth(heroTemp);
   epaper.setFreeFont(nullptr);
-  drawDegreeSymbol(4 + heroWidth + 5, kStripHeight + 17, 3, TFT_RED);
+  drawDegreeSymbol(4 + heroWidth + 3, heroY + 6, 2, TFT_RED);
 
-  drawWeatherIcon(today, 4 + kWeatherIcon40Width / 2, kStripHeight + 38);
-
-  // High and low beside the icon, marked rather than merely coloured.
   epaper.setTextColor(TFT_BLACK, TFT_WHITE);
-  drawUpMarker(50, kStripHeight + 44, TFT_RED);
-  epaper.drawString(String(today.tempMax), 60, kStripHeight + 38, 2);
-  drawDownMarker(50, kStripHeight + 62, TFT_BLACK);
-  epaper.drawString(String(today.tempMin), 60, kStripHeight + 56, 2);
+  drawUpMarker(4, kStripHeight + 44, TFT_RED);
+  epaper.drawString(String(today.tempMax), 14, kStripHeight + 38, 2);
+  drawDownMarker(4, kStripHeight + 62, TFT_BLACK);
+  epaper.drawString(String(today.tempMin), 14, kStripHeight + 56, 2);
 
-  epaper.drawString(clampTextToWidth(weatherLabel(today), kHeroWidth - 8, 1), 4, kStripHeight + 78, 1);
+  epaper.drawString(clampTextToWidth(weatherLabel(today), kHeroWidth - 8, 1), 4, kStripHeight + 86, 1);
 
   // Rain carries its unit; sun times carry markers.
   String rain = String(forecast.precipitationMm / 10);
@@ -2575,11 +2614,11 @@ void drawModernForecast(const ForecastData& forecast)
   }
   // Rain and sun times need their own lines - drawing both from x=4 put the
   // sunrise marker straight over the rainfall figure.
-  epaper.drawString(rain + "mm", 4, kStripHeight + 88, 1);
-  drawUpMarker(4, kStripHeight + 99, TFT_BLACK);
-  epaper.drawString(forecast.sunrise, 13, kStripHeight + 98, 1);
-  drawDownMarker(52, kStripHeight + 99, TFT_BLACK);
-  epaper.drawString(forecast.sunset, 61, kStripHeight + 98, 1);
+  epaper.drawString(rain + "mm", 4, kStripHeight + 96, 1);
+  drawUpMarker(46, kStripHeight + 97, TFT_BLACK);
+  epaper.drawString(forecast.sunrise, 55, kStripHeight + 96, 1);
+  drawDownMarker(88, kStripHeight + 97, TFT_BLACK);
+  epaper.drawString(forecast.sunset, 97, kStripHeight + 96, 1);
 
   epaper.drawFastVLine(kHeroWidth, kStripHeight + 2, height - kStripHeight - 4, TFT_BLACK);
 
