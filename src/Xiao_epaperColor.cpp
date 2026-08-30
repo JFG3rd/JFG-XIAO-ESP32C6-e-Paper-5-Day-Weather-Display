@@ -440,6 +440,7 @@ struct UiText
   const char* unitsLabel;
   const char* quietHoursLabel;
   const char* quietFromLabel;
+  const char* quietSummaryPrefix;
   const char* quietToLabel;
   const char* batteryWarnLabel;
   const char* batteryPackLabel;
@@ -557,6 +558,7 @@ const UiText kUiText[] = {
         "Units",
         "Quiet hours (skip night refreshes)",
         "From",
+        "No updates between",
         "To",
         "Warn and conserve below",
         "Battery size",
@@ -673,6 +675,7 @@ const UiText kUiText[] = {
         "Einheiten",
         "Ruhezeiten (keine Updates nachts)",
         "Von",
+        "Keine Updates zwischen",
         "Bis",
         "Warnen und sparen unter",
         "Batteriegroesse",
@@ -789,6 +792,7 @@ const UiText kUiText[] = {
         "Unidades",
         "Horas de silencio (sin refrescos de noche)",
         "Desde",
+        "Sin actualizaciones entre",
         "Hasta",
         "Avisar y ahorrar por debajo de",
         "Tamano de bateria",
@@ -905,6 +909,7 @@ const UiText kUiText[] = {
         "Unites",
         "Heures calmes (pas de mise a jour la nuit)",
         "De",
+        "Pas de mises a jour entre",
         "A",
         "Alerter et economiser sous",
         "Taille de la batterie",
@@ -3177,6 +3182,29 @@ String buildTimezoneOptions()
   return options;
 }
 
+// Hours as "HH:00" rather than a bare number box. The field only ever stored an
+// hour, but a number input invites "23:00" or "11pm" and then silently accepts
+// whatever survives parseInt.
+String buildHourOptions(uint8_t selected)
+{
+  String options;
+  for (uint8_t hour = 0; hour < 24; ++hour) {
+    options += "<option value='";
+    options += String(hour);
+    options += "'";
+    if (hour == selected) {
+      options += " selected";
+    }
+    options += ">";
+    if (hour < 10) {
+      options += "0";
+    }
+    options += String(hour);
+    options += ":00</option>";
+  }
+  return options;
+}
+
 String buildRefreshOptions()
 {
   String options;
@@ -4430,9 +4458,10 @@ String buildMainPage()
       </div>
       <div id="grpQuiet">
       <label for="quietStart">{{QUIET_FROM_LABEL}}</label>
-      <input type="number" id="quietStart" min="0" max="23">
+      <select id="quietStart">{{QUIET_START_OPTIONS}}</select>
       <label for="quietEnd">{{QUIET_TO_LABEL}}</label>
-      <input type="number" id="quietEnd" min="0" max="23">
+      <select id="quietEnd">{{QUIET_END_OPTIONS}}</select>
+      <div id="quietSummary" class="sleep-hint"></div>
       </div>
       <label for="batteryPack">{{BATTERY_PACK_LABEL}}</label>
       <select id="batteryPack">{{BATTERY_PACK_OPTIONS}}</select>
@@ -4441,7 +4470,8 @@ String buildMainPage()
         <label class="switch"><input type="checkbox" id="batteryWarnEnabled" aria-label="{{BATTERY_WARN_LABEL}}"><span class="slider"></span></label>
       </div>
       <div id="grpBatteryWarn">
-      <input type="number" id="batteryWarnPercent" min="0" max="100">
+      <input type="number" id="batteryWarnPercent" min="0" max="100" aria-describedby="battPctHint">
+      <div id="battPctHint" class="sleep-hint">%</div>
       </div>
       <div class="button-row" style="grid-template-columns:1fr">
         <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
@@ -4481,7 +4511,8 @@ String buildMainPage()
       batteryEstimatedNote: '{{BATTERY_ESTIMATED_NOTE}}',
       confirmSave: '{{CONFIRM_SAVE}}',
       previewUnsaved: '{{PREVIEW_UNSAVED}}',
-      previewApplying: '{{PREVIEW_APPLYING}}'
+      previewApplying: '{{PREVIEW_APPLYING}}',
+      quietSummaryPrefix: '{{QUIET_SUMMARY_PREFIX}}'
     };
     let currentConnectedSsid = '';
     // Settings inputs are filled from the device only until the first fill
@@ -4576,6 +4607,7 @@ String buildMainPage()
       }
       settingsLoaded = true;
       updateConditionalFields();
+      updateQuietSummary();
       setIfIdle('unitTemp', status.fahrenheit ? 'f' : 'c');
       setIfIdle('unitWind', status.mph ? 'mph' : 'kmh');
       setIfIdle('quietEnabled', status.quietEnabled);
@@ -4700,6 +4732,25 @@ String buildMainPage()
     // Settings that cannot apply right now are hidden rather than left to be
     // adjusted to no effect: layout and the header lines only shape the classic
     // design, and the quiet/battery values only matter when their toggle is on.
+    // Say the window back in plain language, including how long it lasts. The
+    // window wraps midnight in the normal case, which is exactly where an hour
+    // pair stops being self-explanatory.
+    function updateQuietSummary() {
+      const el = document.getElementById('quietSummary');
+      if (!el) { return; }
+      const from = parseInt(document.getElementById('quietStart').value, 10);
+      const to = parseInt(document.getElementById('quietEnd').value, 10);
+      if (isNaN(from) || isNaN(to)) { el.textContent = ''; return; }
+      const hours = (to - from + 24) % 24;
+      const hh = h => String(h).padStart(2, '0') + ':00';
+      el.textContent = hours === 0
+        ? ''
+        : `${ui.quietSummaryPrefix} ${hh(from)} - ${hh(to)} (${hours} h)`;
+    }
+    ['quietStart', 'quietEnd'].forEach(id => {
+      document.getElementById(id).addEventListener('change', updateQuietSummary);
+    });
+
     function updateConditionalFields() {
       const show = (id, on) => {
         const el = document.getElementById(id);
@@ -4802,6 +4853,9 @@ String buildMainPage()
   page.replace("{{UNITS_LABEL}}", t.unitsLabel);
   page.replace("{{QUIET_HOURS_LABEL}}", t.quietHoursLabel);
   page.replace("{{QUIET_FROM_LABEL}}", t.quietFromLabel);
+  page.replace("{{QUIET_START_OPTIONS}}", buildHourOptions(quietStartHour));
+  page.replace("{{QUIET_END_OPTIONS}}", buildHourOptions(quietEndHour));
+  page.replace("{{QUIET_SUMMARY_PREFIX}}", t.quietSummaryPrefix);
   page.replace("{{QUIET_TO_LABEL}}", t.quietToLabel);
   page.replace("{{BATTERY_WARN_LABEL}}", t.batteryWarnLabel);
   page.replace("{{BATTERY_PACK_LABEL}}", t.batteryPackLabel);
