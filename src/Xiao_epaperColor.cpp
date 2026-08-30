@@ -428,6 +428,10 @@ struct UiText
   const char* warnSourceOff;
   const char* warnSourceDerived;
   const char* warnSourceDwd;
+  const char* advancedTitle;
+  const char* backLink;
+  const char* debugTitle;
+  const char* rebootButton;
   const char* settingsTitle;
   const char* locationLabelText;
   const char* latitudeLabel;
@@ -541,6 +545,10 @@ const UiText kUiText[] = {
         "Off",
         "From forecast",
         "Official (DWD)",
+        "Setup & Diagnostics",
+        "Back",
+        "Debug",
+        "Reboot",
         "Settings",
         "Location name",
         "Latitude",
@@ -653,6 +661,10 @@ const UiText kUiText[] = {
         "Aus",
         "Aus Vorhersage",
         "Amtlich (DWD)",
+        "Setup & Diagnose",
+        "Zurueck",
+        "Debug",
+        "Neustart",
         "Einstellungen",
         "Ortsname",
         "Breitengrad",
@@ -765,6 +777,10 @@ const UiText kUiText[] = {
         "Desactivado",
         "De la prevision",
         "Oficial (DWD)",
+        "Configuracion y diagnostico",
+        "Volver",
+        "Depuracion",
+        "Reiniciar",
         "Ajustes",
         "Nombre del lugar",
         "Latitud",
@@ -877,6 +893,10 @@ const UiText kUiText[] = {
         "Desactive",
         "De la prevision",
         "Officiel (DWD)",
+        "Configuration et diagnostic",
+        "Retour",
+        "Debogage",
+        "Redemarrer",
         "Parametres",
         "Nom du lieu",
         "Latitude",
@@ -3815,17 +3835,11 @@ String buildScanJson()
   return json;
 }
 
-String buildMainPage()
+// The stylesheet, shared by the control page and the advanced page so the two
+// cannot drift apart.
+String pageStyles()
 {
-  const UiText& t = ui();
-  String page = R"rawliteral(
-<!DOCTYPE html>
-<html lang="{{LANG}}">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{TITLE}}</title>
-  <style>
+  return F(R"rawcss(
     :root {
       --page-bg: #f0b37e;
       --page-text: #001F4D;
@@ -4031,42 +4045,35 @@ String buildMainPage()
       .dashboard { padding: 0 10px; column-width: auto; column-count: 1; }
       .button-row { grid-template-columns: 1fr; }
     }
-  </style>
+)rawcss");
+}
+
+// The advanced page: network setup, firmware and the debugging tools. Split out
+// so the everyday page carries only what is looked at every day. Shares the
+// stylesheet with the control page so the two cannot drift apart.
+String buildAdvancedPage()
+{
+  const UiText& t = ui();
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html lang="{{LANG}}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <style>{{STYLES}}</style>
 </head>
 <body>
   <div class="page-header">
     <div class="header-left">
-      <h1>{{TITLE}}</h1>
+      <h1>{{ADVANCED_TITLE}}</h1>
       <div id="summary">{{LOADING_STATE}}</div>
     </div>
     <div class="header-right">
-      <div class="lang-row">
-        <select id="language">{{LANGUAGE_OPTIONS}}</select>
-      </div>
-      <label class="switch" title="Dark mode">
-        <input type="checkbox" id="darkToggle" aria-label="Dark mode">
-        <span class="slider"></span>
-      </label>
+      <a class="button btn-nav" href="/">{{BACK_LINK}}</a>
     </div>
   </div>
   <div class="dashboard">
-    <div class="card">
-      <h2 class="card-title">{{STATUS_TITLE}}</h2>
-      <div id="status" class="info-grid"></div>
-      <div class="sleep-row">
-        <span>{{SLEEP_MODE_LABEL}}</span>
-        <label class="switch" title="{{SLEEP_MODE_LABEL}}">
-          <input type="checkbox" id="sleepToggle" aria-label="{{SLEEP_MODE_LABEL}}">
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="sleep-hint">{{SLEEP_MODE_HINT}}</div>
-      <label for="refreshMinutes">{{REFRESH_INTERVAL_LABEL}}</label>
-      <select id="refreshMinutes">{{REFRESH_OPTIONS}}</select>
-      <div class="button-row" style="grid-template-columns:1fr">
-        <button class="btn-nav" onclick="markBatteryFull()">{{BATTERY_CHARGED_BUTTON}}</button>
-      </div>
-    </div>
     <div class="card">
       <h2 class="card-title">{{WIFI_SETUP_TITLE}}</h2>
       <label for="ssid">{{SSID_LABEL}}</label>
@@ -4097,6 +4104,257 @@ String buildMainPage()
       <div class="button-row">
         <button class="btn-nav" onclick="refreshForecast()">{{REFRESH_FORECAST}}</button>
         <button class="btn-danger" onclick="forgetWiFi()">{{FORGET_WIFI}}</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{OTA_TITLE}}</h2>
+      <div class="sleep-hint">{{OTA_HINT}}</div>
+      <input type="file" id="fwFile" accept=".bin">
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-save" onclick="uploadFirmware()">{{OTA_BUTTON}}</button>
+      </div>
+      <div id="otaProgress" class="sleep-hint"></div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{DEBUG_TITLE}}</h2>
+      <div class="sleep-row">
+        <span>{{SLEEP_MODE_LABEL}}</span>
+        <label class="switch" title="{{SLEEP_MODE_LABEL}}">
+          <input type="checkbox" id="sleepToggle" aria-label="{{SLEEP_MODE_LABEL}}">
+          <span class="slider"></span>
+        </label>
+      </div>
+      <div class="sleep-hint">{{SLEEP_MODE_HINT}}</div>
+      <label>{{KEEP_AWAKE_LABEL}}</label>
+      <div class="button-row" style="grid-template-columns:repeat(4,1fr)">
+        <button class="btn-nav" onclick="keepAwake(15)">15m</button>
+        <button class="btn-nav" onclick="keepAwake(30)">30m</button>
+        <button class="btn-nav" onclick="keepAwake(60)">60m</button>
+        <button class="btn-nav" onclick="keepAwake(0)">off</button>
+      </div>
+      <div id="keepAwakeState" class="sleep-hint"></div>
+      <div class="button-row">
+        <button class="btn-nav" onclick="refreshForecast()">{{REFRESH_FORECAST}}</button>
+        <button class="btn-danger" onclick="rebootDevice()">{{REBOOT_BUTTON}}</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2 class="card-title">{{LOGS_TITLE}}</h2>
+      <div class="log-container">
+        <pre id="logs" tabindex="0">{{LOADING_LOGS}}</pre>
+      </div>
+    </div>
+  </div>
+  <script>
+    const ui = { statusIp: '{{STATUS_IP}}' };
+    (function() {
+      const stored = localStorage.getItem('darkMode');
+      const prefersDark = stored === null &&
+        window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (stored === '1' || prefersDark) { document.body.classList.add('dark-mode'); }
+    })();
+    async function fetchJson(path, options) {
+      const response = await fetch(path, options);
+      if (!response.ok) throw new Error(await response.text());
+      return response.json();
+    }
+    async function updateLogs() {
+      const logs = await fetchJson('/logs');
+      document.getElementById('logs').textContent = logs.join('\n');
+    }
+    async function updateStatus() {
+      const status = await fetchJson('/status');
+      document.getElementById('summary').textContent =
+        `${status.ssid || '-'} | ${status.ip || '-'}`;
+      const sleepToggle = document.getElementById('sleepToggle');
+      if (sleepToggle && document.activeElement !== sleepToggle) {
+        sleepToggle.checked = !!status.deepSleepEnabled;
+      }
+      const ka = document.getElementById('keepAwakeState');
+      if (ka) {
+        ka.textContent = status.keepAwakeSecondsLeft > 0
+          ? `awake for another ${Math.round(status.keepAwakeSecondsLeft / 60)} min` : '';
+      }
+      const cb = document.getElementById('static_enabled');
+      if (cb && !cb.checked && status.wifiConnected) {
+        const fill = (id, val) => { const el = document.getElementById(id); if (el && !el.value) el.value = val || ''; };
+        fill('static_ip', status.dhcpIp); fill('static_gw', status.dhcpGw);
+        fill('static_subnet', status.dhcpSubnet); fill('static_dns1', status.dhcpDns1);
+        fill('static_dns2', status.dhcpDns2);
+      }
+    }
+    async function scanNetworks() {
+      const select = document.getElementById('ssid');
+      select.innerHTML = '<option>Scanning...</option>';
+      const networks = await fetchJson('/scan');
+      select.innerHTML = '';
+      if (!networks.length) { select.innerHTML = '<option value="">No networks found</option>'; return; }
+      networks.forEach(n => {
+        const option = document.createElement('option');
+        option.value = n.ssid;
+        option.textContent = `${n.ssid} (${n.rssi} dBm)`;
+        select.appendChild(option);
+      });
+    }
+    async function saveWiFi() {
+      const manual = document.getElementById('manual_ssid').value.trim();
+      const ssid = manual || document.getElementById('ssid').value;
+      if (!ssid) { alert('SSID is required'); return; }
+      const response = await fetch('/saveWiFi', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          ssid, password: document.getElementById('password').value,
+          staticEnabled: document.getElementById('static_enabled').checked,
+          staticIp: document.getElementById('static_ip').value.trim(),
+          staticGw: document.getElementById('static_gw').value.trim(),
+          staticSubnet: document.getElementById('static_subnet').value.trim(),
+          staticDns1: document.getElementById('static_dns1').value.trim(),
+          staticDns2: document.getElementById('static_dns2').value.trim()
+        })
+      });
+      alert(await response.text());
+    }
+    async function forgetWiFi() {
+      if (!confirm('{{CONFIRM_SAVE}}')) { return; }
+      alert(await (await fetch('/forgetWiFi', {method: 'POST'})).text());
+    }
+    async function refreshForecast() {
+      alert(await (await fetch('/refresh', {method: 'POST'})).text());
+      await updateLogs();
+    }
+    async function rebootDevice() {
+      if (!confirm('{{CONFIRM_SAVE}}')) { return; }
+      alert(await (await fetch('/reboot', {method: 'POST'})).text());
+    }
+    async function setSleepMode() {
+      await fetch('/sleepMode', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled: document.getElementById('sleepToggle').checked})
+      });
+      await updateStatus();
+    }
+    async function keepAwake(minutes) {
+      const r = await fetch('/keepAwake', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({minutes})
+      });
+      document.getElementById('keepAwakeState').textContent = await r.text();
+    }
+    function uploadFirmware() {
+      const input = document.getElementById('fwFile');
+      const out = document.getElementById('otaProgress');
+      if (!input.files.length) { alert('Choose a .bin file first'); return; }
+      const data = new FormData();
+      data.append('firmware', input.files[0]);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/update');
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) { out.textContent = `${Math.round((e.loaded / e.total) * 100)}%`; }
+      };
+      xhr.onload = () => { out.textContent = xhr.responseText; };
+      xhr.onerror = () => { out.textContent = 'Upload failed (connection lost).'; };
+      xhr.send(data);
+    }
+    document.getElementById('sleepToggle').addEventListener('change', setSleepMode);
+    document.getElementById('manual_ssid').addEventListener('input', e => {
+      if (e.target.value.trim()) { document.getElementById('ssid').value = e.target.value.trim(); }
+    });
+    // Polling pauses while the tab is hidden; on this device that also stops the
+    // page holding the display awake.
+    let timer = null;
+    function startPolling() { if (timer === null) { timer = setInterval(() => { updateStatus(); updateLogs(); }, 6000); } }
+    function stopPolling() { clearInterval(timer); timer = null; }
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { stopPolling(); } else { updateStatus(); updateLogs(); startPolling(); }
+    });
+    scanNetworks().then(updateStatus).then(updateLogs);
+    startPolling();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  page.replace("{{STYLES}}", pageStyles());
+  page.replace("{{LANG}}", kUiText[static_cast<uint8_t>(currentLanguage)].code);
+  page.replace("{{TITLE}}", t.title);
+  page.replace("{{ADVANCED_TITLE}}", t.advancedTitle);
+  page.replace("{{BACK_LINK}}", t.backLink);
+  page.replace("{{DEBUG_TITLE}}", t.debugTitle);
+  page.replace("{{REBOOT_BUTTON}}", t.rebootButton);
+  page.replace("{{LOADING_STATE}}", t.loadingState);
+  page.replace("{{LOADING_LOGS}}", t.loadingLogs);
+  page.replace("{{LOGS_TITLE}}", t.logsTitle);
+  page.replace("{{WIFI_SETUP_TITLE}}", t.wifiSetupTitle);
+  page.replace("{{SSID_LABEL}}", t.ssidLabel);
+  page.replace("{{HIDDEN_SSID_LABEL}}", t.hiddenSsidLabel);
+  page.replace("{{PASSWORD_LABEL}}", t.passwordLabel);
+  page.replace("{{SAVE_REBOOT}}", t.saveReboot);
+  page.replace("{{RESCAN}}", t.rescan);
+  page.replace("{{REFRESH_FORECAST}}", t.refreshForecast);
+  page.replace("{{FORGET_WIFI}}", t.forgetWifi);
+  page.replace("{{STATIC_IP_TITLE}}", t.staticIpTitle);
+  page.replace("{{STATIC_IP_ENABLE}}", t.staticIpEnable);
+  page.replace("{{STATIC_IP_CHECKED}}", staticIpConfig.enabled ? "checked" : "");
+  page.replace("{{STATIC_IP_ADDRESS}}", t.staticIpAddress);
+  page.replace("{{STATIC_IP_GATEWAY}}", t.staticIpGateway);
+  page.replace("{{STATIC_IP_SUBNET}}", t.staticIpSubnet);
+  page.replace("{{STATIC_IP_DNS1}}", t.staticIpDns1);
+  page.replace("{{STATIC_IP_DNS2}}", t.staticIpDns2);
+  page.replace("{{STATUS_IP}}", t.statusIp);
+  page.replace("{{OTA_TITLE}}", t.otaTitle);
+  page.replace("{{OTA_HINT}}", t.otaHint);
+  page.replace("{{OTA_BUTTON}}", t.otaButton);
+  page.replace("{{SLEEP_MODE_LABEL}}", t.sleepModeLabel);
+  page.replace("{{SLEEP_MODE_HINT}}", t.sleepModeHint);
+  page.replace("{{KEEP_AWAKE_LABEL}}", t.keepAwakeLabel);
+  page.replace("{{CONFIRM_SAVE}}", t.confirmSave);
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+  const bool useStatic = staticIpConfig.enabled && static_cast<uint32_t>(staticIpConfig.ip) != 0;
+  page.replace("{{STATIC_IP_VALUE}}", useStatic ? staticIpConfig.ip.toString() : (connected ? WiFi.localIP().toString() : String("")));
+  page.replace("{{STATIC_GW_VALUE}}", useStatic ? staticIpConfig.gateway.toString() : (connected ? WiFi.gatewayIP().toString() : String("")));
+  page.replace("{{STATIC_SUBNET_VALUE}}", useStatic ? staticIpConfig.subnet.toString() : (connected ? WiFi.subnetMask().toString() : String("")));
+  page.replace("{{STATIC_DNS1_VALUE}}", useStatic ? staticIpConfig.dns1.toString() : (connected ? WiFi.dnsIP(0).toString() : String("")));
+  page.replace("{{STATIC_DNS2_VALUE}}", useStatic ? staticIpConfig.dns2.toString() : (connected ? WiFi.dnsIP(1).toString() : String("")));
+  return page;
+}
+
+String buildMainPage()
+{
+  const UiText& t = ui();
+  String page = R"rawliteral(
+<!DOCTYPE html>
+<html lang="{{LANG}}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}}</title>
+  <style>{{STYLES}}</style>
+</head>
+<body>
+  <div class="page-header">
+    <div class="header-left">
+      <h1>{{TITLE}}</h1>
+      <div id="summary">{{LOADING_STATE}}</div>
+    </div>
+    <div class="header-right">
+      <div class="lang-row">
+        <select id="language">{{LANGUAGE_OPTIONS}}</select>
+      </div>
+      <a class="button btn-nav" href="/advanced" style="width:auto;padding:8px 12px">{{ADVANCED_TITLE}}</a>
+      <label class="switch" title="Dark mode">
+        <input type="checkbox" id="darkToggle" aria-label="Dark mode">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+  <div class="dashboard">
+    <div class="card">
+      <h2 class="card-title">{{STATUS_TITLE}}</h2>
+      <div id="status" class="info-grid"></div>
+      <label for="refreshMinutes">{{REFRESH_INTERVAL_LABEL}}</label>
+      <select id="refreshMinutes">{{REFRESH_OPTIONS}}</select>
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-nav" onclick="markBatteryFull()">{{BATTERY_CHARGED_BUTTON}}</button>
       </div>
     </div>
     <div class="card">
@@ -4143,14 +4401,6 @@ String buildMainPage()
         <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
       </div>
       <div id="saveNote" class="sleep-hint"></div>
-      <label>{{KEEP_AWAKE_LABEL}}</label>
-      <div class="button-row" style="grid-template-columns:repeat(4,1fr)">
-        <button class="btn-nav" onclick="keepAwake(15)">15m</button>
-        <button class="btn-nav" onclick="keepAwake(30)">30m</button>
-        <button class="btn-nav" onclick="keepAwake(60)">60m</button>
-        <button class="btn-nav" onclick="keepAwake(0)">off</button>
-      </div>
-      <div id="keepAwakeState" class="sleep-hint"></div>
     </div>
     <div class="card">
       <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
@@ -4189,20 +4439,7 @@ String buildMainPage()
         <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
       </div>
     </div>
-    <div class="card">
-      <h2 class="card-title">{{OTA_TITLE}}</h2>
-      <div class="sleep-hint">{{OTA_HINT}}</div>
-      <input type="file" id="fwFile" accept=".bin">
-      <div class="button-row" style="grid-template-columns:1fr">
-        <button class="btn-save" onclick="uploadFirmware()">{{OTA_BUTTON}}</button>
-      </div>
-      <div id="otaProgress" class="sleep-hint"></div>
-    </div>
-    <div class="card">
-      <h2 class="card-title">{{LOGS_TITLE}}</h2>
-      <div class="log-container">
-        <pre id="logs">{{LOADING_LOGS}}</pre>
-      </div>
+  </div>
     </div>
   </div>
   <!-- Open-Meteo publish under CC BY 4.0 and ask for a credit with a link next to
@@ -4285,29 +4522,7 @@ String buildMainPage()
       const power = status.charging ? ' \u00b7 charging?' : (status.usbConnected ? ' \u00b7 USB' : '');
       return `<span class="battery"><span class="battery-body"><span class="battery-fill${low}" style="width:${percent}%"></span></span>${percent}%${volts}${note}${power}</span>`;
     }
-    async function scanNetworks() {
-      const select = document.getElementById('ssid');
-      select.innerHTML = '<option>Scanning...</option>';
-      const networks = await fetchJson('/scan');
-      select.innerHTML = '';
-      if (!networks.length) {
-        select.innerHTML = '<option value="">No networks found</option>';
-        return;
-      }
-      networks.forEach(n => {
-        const option = document.createElement('option');
-        option.value = n.ssid;
-        option.textContent = `${n.ssid} (${n.rssi} dBm)`;
-        select.appendChild(option);
-      });
-      // Auto-select current SSID after scan
-      if (currentConnectedSsid) {
-        for (const opt of select.options) {
-          if (opt.value === currentConnectedSsid) { opt.selected = true; break; }
-        }
-      }
-    }
-    async function updateStatus() {
+        async function updateStatus() {
       const status = await fetchJson('/status');
       currentConnectedSsid = status.ssid || '';
       document.getElementById('summary').textContent =
@@ -4351,12 +4566,6 @@ String buildMainPage()
           : '';
       }
       settingsLoaded = true;
-      const ka = document.getElementById('keepAwakeState');
-      if (ka) {
-        ka.textContent = status.keepAwakeSecondsLeft > 0
-          ? `awake for another ${Math.round(status.keepAwakeSecondsLeft / 60)} min`
-          : '';
-      }
       setIfIdle('unitTemp', status.fahrenheit ? 'f' : 'c');
       setIfIdle('unitWind', status.mph ? 'mph' : 'kmh');
       setIfIdle('quietEnabled', status.quietEnabled);
@@ -4364,64 +4573,8 @@ String buildMainPage()
       setIfIdle('quietEnd', status.quietEnd);
       setIfIdle('batteryWarnEnabled', status.batteryWarnEnabled);
       setIfIdle('batteryWarnPercent', status.batteryWarnPercent);
-      const sleepToggle = document.getElementById('sleepToggle');
-      // Do not fight the user mid-click: only sync the toggle when it is idle.
-      if (sleepToggle && document.activeElement !== sleepToggle) {
-        sleepToggle.checked = !!status.deepSleepEnabled;
-      }
-      const cb = document.getElementById('static_enabled');
-      if (cb && !cb.checked && status.wifiConnected) {
-        const fill = (id, val) => { const el = document.getElementById(id); if (el && !el.value) el.value = val || ''; };
-        fill('static_ip', status.dhcpIp);
-        fill('static_gw', status.dhcpGw);
-        fill('static_subnet', status.dhcpSubnet);
-        fill('static_dns1', status.dhcpDns1);
-        fill('static_dns2', status.dhcpDns2);
-      }
-      // Pre-select current SSID in dropdown
-      if (currentConnectedSsid) {
-        const sel = document.getElementById('ssid');
-        for (const opt of sel.options) {
-          if (opt.value === currentConnectedSsid) { opt.selected = true; break; }
-        }
-      }
     }
-    async function updateLogs() {
-      const logs = await fetchJson('/logs');
-      document.getElementById('logs').textContent = logs.join('\n');
-    }
-    async function saveWiFi() {
-      const manual = document.getElementById('manual_ssid').value.trim();
-      const ssid = manual || document.getElementById('ssid').value;
-      const password = document.getElementById('password').value;
-      const staticEnabled = document.getElementById('static_enabled').checked;
-      const staticIp = document.getElementById('static_ip').value.trim();
-      const staticGw = document.getElementById('static_gw').value.trim();
-      const staticSubnet = document.getElementById('static_subnet').value.trim();
-      const staticDns1 = document.getElementById('static_dns1').value.trim();
-      const staticDns2 = document.getElementById('static_dns2').value.trim();
-      if (!ssid) { alert('SSID is required'); return; }
-      const response = await fetch('/saveWiFi', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          ssid, password, staticEnabled,
-          staticIp, staticGw, staticSubnet, staticDns1, staticDns2
-        })
-      });
-      alert(await response.text());
-    }
-    async function refreshForecast() {
-      const response = await fetch('/refresh', {method: 'POST'});
-      alert(await response.text());
-      await updateStatus();
-      await updateLogs();
-    }
-    async function forgetWiFi() {
-      const response = await fetch('/forgetWiFi', {method: 'POST'});
-      alert(await response.text());
-    }
-    async function setLanguage() {
+                    async function setLanguage() {
       const lang = document.getElementById('language').value;
       await fetch('/language', {
         method: 'POST',
@@ -4430,17 +4583,7 @@ String buildMainPage()
       });
       location.reload();
     }
-    async function setSleepMode() {
-      const enabled = document.getElementById('sleepToggle').checked;
-      await fetch('/sleepMode', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({enabled})
-      });
-      await updateStatus();
-      await updateLogs();
-    }
-    async function setRefreshInterval() {
+        async function setRefreshInterval() {
       const minutes = parseInt(document.getElementById('refreshMinutes').value, 10);
       await fetch('/refreshInterval', {
         method: 'POST',
@@ -4546,59 +4689,23 @@ String buildMainPage()
       document.getElementById(id).addEventListener('change', previewSettings);
     });
     document.getElementById('locLabel').addEventListener('change', previewSettings);
-    async function keepAwake(minutes) {
-      const r = await fetch('/keepAwake', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({minutes})
-      });
-      document.getElementById('keepAwakeState').textContent = await r.text();
-      await updateStatus();
-    }
-    function uploadFirmware() {
-      const input = document.getElementById('fwFile');
-      const out = document.getElementById('otaProgress');
-      if (!input.files.length) { alert('Choose a .bin file first'); return; }
-      const data = new FormData();
-      data.append('firmware', input.files[0]);
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/update');
-      xhr.upload.onprogress = e => {
-        if (e.lengthComputable) {
-          out.textContent = `${Math.round((e.loaded / e.total) * 100)}%`;
-        }
-      };
-      xhr.onload = () => { out.textContent = xhr.responseText; };
-      xhr.onerror = () => { out.textContent = 'Upload failed (connection lost).'; };
-      xhr.send(data);
-    }
-    document.getElementById('refreshMinutes').addEventListener('change', setRefreshInterval);
-    document.getElementById('sleepToggle').addEventListener('change', setSleepMode);
+            document.getElementById('refreshMinutes').addEventListener('change', setRefreshInterval);
     document.getElementById('language').addEventListener('change', setLanguage);
-    document.getElementById('manual_ssid').addEventListener('input', e => {
-      if (e.target.value.trim()) {
-        document.getElementById('ssid').value = e.target.value.trim();
-      }
-    });
-    scanNetworks().then(updateStatus).then(updateLogs);
+    updateStatus();
     // Only poll while the page is actually visible. A backgrounded tab was
     // costing mobile battery and, worse, holding the device awake: every request
     // extends its awake window, so a forgotten tab kept it out of deep sleep up
     // to the 10-minute cap.
     let statusTimer = null;
-    let logsTimer = null;
     function startPolling() {
       if (statusTimer === null) { statusTimer = setInterval(updateStatus, 8000); }
-      if (logsTimer === null) { logsTimer = setInterval(updateLogs, 5000); }
     }
-    function stopPolling() {
-      clearInterval(statusTimer); statusTimer = null;
-      clearInterval(logsTimer); logsTimer = null;
-    }
+    function stopPolling() { clearInterval(statusTimer); statusTimer = null; }
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
         stopPolling();
       } else {
-        updateStatus(); updateLogs(); startPolling();
+        updateStatus(); startPolling();
       }
     });
     startPolling();
@@ -4607,6 +4714,7 @@ String buildMainPage()
 </html>
 )rawliteral";
 
+  page.replace("{{STYLES}}", pageStyles());
   page.replace("{{LANG}}", kUiText[static_cast<uint8_t>(currentLanguage)].code);
   page.replace("{{TITLE}}", t.title);
   page.replace("{{LOADING_STATE}}", t.loadingState);
@@ -4616,6 +4724,7 @@ String buildMainPage()
   page.replace("{{REFRESH_INTERVAL_LABEL}}", t.refreshIntervalLabel);
   page.replace("{{BATTERY_CHARGED_BUTTON}}", t.batteryChargedButton);
   page.replace("{{BATTERY_ESTIMATED_NOTE}}", t.batteryEstimatedNote);
+  page.replace("{{ADVANCED_TITLE}}", t.advancedTitle);
   page.replace("{{SETTINGS_TITLE}}", t.settingsTitle);
   page.replace("{{WARNING_SOURCE_LABEL}}", t.warningSourceLabel);
   page.replace("{{HEADER_MODE_LABEL}}", t.headerModeLabel);
@@ -4706,7 +4815,6 @@ String buildMainPage()
   page.replace("{{FORECAST_MISSING}}", t.forecastNotLoaded);
   page.replace("{{LANGUAGE_LABEL}}", t.languageLabel);
   page.replace("{{LANGUAGE_OPTIONS}}", buildLanguageOptions());
-  page.replace("{{STATIC_IP_CHECKED}}", staticIpConfig.enabled ? "checked" : "");
   return page;
 }
 
@@ -4880,6 +4988,13 @@ void handleRoot()
     return;
   }
   server.send(200, "text/html", buildMainPage());
+}
+
+void handleAdvanced()
+{
+  noteWebActivity();
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", buildAdvancedPage());
 }
 
 void handleLogs()
@@ -5659,6 +5774,7 @@ void setupWebServer()
   server.collectHeaders(headers, 2);
   server.on("/", HTTP_GET, handleRoot);
   server.on("/portal", HTTP_GET, handlePortal);
+  server.on("/advanced", HTTP_GET, handleAdvanced);
   server.on("/hotspot-detect.html", HTTP_GET, handleAppleCaptiveProbe);
   server.on("/canonical.html", HTTP_GET, handleAppleCaptiveProbe);
   server.on("/library/test/success.html", HTTP_GET, handleAppleCaptiveProbe);
