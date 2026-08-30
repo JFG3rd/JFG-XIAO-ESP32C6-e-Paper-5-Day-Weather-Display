@@ -3985,10 +3985,13 @@ String pageStyles()
       display: flex; justify-content: space-between; align-items: center; gap: 10px;
       margin-top: 10px; font-size: 12px; color: var(--info-text);
     }
-    /* 128x296 buffer rotated a quarter turn into the 296x128 view the panel shows. */
+    /* 128x296 buffer rotated a quarter turn into the 296x128 view the panel shows.
+       A rotation does not change the layout box, so the container cannot size
+       itself around the rotated image - fitPreview() measures the card and sets
+       both the scale and the height. The previous fixed scale(1.5) made the image
+       444px wide inside a ~340px card, so overflow:hidden silently cropped it. */
     .panel-preview {
-      /* Scaled up: at 1:1 the 296x128 panel is unreadably small on a phone. */
-      height: 192px; display: flex; align-items: center; justify-content: center;
+      width: 100%; display: flex; align-items: center; justify-content: center;
       overflow: hidden; margin: 10px 0;
       border: 1px solid var(--input-border); border-radius: 4px; background: #fff;
     }
@@ -3996,7 +3999,7 @@ String pageStyles()
       /* The buffer is portrait and its first row is the panel's right edge, so
          the quarter turn is anticlockwise. Turning it the other way renders the
          preview upside down. */
-      transform: rotate(-90deg) scale(1.5);
+      transform-origin: center;
       image-rendering: pixelated;
       max-width: none;
     }
@@ -4349,6 +4352,45 @@ String buildMainPage()
   </div>
   <div class="dashboard">
     <div class="card">
+      <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
+      <!-- The framebuffer is the panel's native portrait 128x296; rotating here
+           avoids second-guessing the sprite's coordinate mapping on the device. -->
+      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="{{PREVIEW_TITLE}}"></div>
+      <div id="previewNote" class="sleep-hint"></div>
+      <label for="design">{{DESIGN_LABEL}}</label>
+      <select id="design">
+        <option value="classic">{{DESIGN_CLASSIC}}</option>
+        <option value="modern">{{DESIGN_MODERN}}</option>
+      </select>
+      <div id="grpClassicOnly">
+      <label for="layout">{{LAYOUT_LABEL}}</label>
+      <select id="layout">
+        <option value="temp">{{LAYOUT_TEMP}}</option>
+        <option value="location">{{LAYOUT_LOCATION}}</option>
+        <option value="both">{{LAYOUT_BOTH}}</option>
+        <option value="info">{{LAYOUT_INFO}}</option>
+      </select>
+      <label for="headerMode">{{HEADER_MODE_LABEL}}</label>
+      <select id="headerMode">
+        <option value="now">{{HEADER_MODE_NOW}}</option>
+        <option value="rain">{{HEADER_MODE_RAIN}}</option>
+        <option value="sun">{{HEADER_MODE_SUN}}</option>
+        <option value="wind">{{HEADER_MODE_WIND}}</option>
+      </select>
+      <label for="headerMode2">{{HEADER_MODE2_LABEL}}</label>
+      <select id="headerMode2">
+        <option value="off">{{MODE_OFF}}</option>
+        <option value="now">{{HEADER_MODE_NOW}}</option>
+        <option value="rain">{{HEADER_MODE_RAIN}}</option>
+        <option value="sun">{{HEADER_MODE_SUN}}</option>
+        <option value="wind">{{HEADER_MODE_WIND}}</option>
+      </select>
+      </div>
+      <div class="button-row" style="grid-template-columns:1fr">
+        <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
+      </div>
+    </div>
+    <div class="card">
       <h2 class="card-title">{{STATUS_TITLE}}</h2>
       <div id="status" class="info-grid"></div>
       <label for="refreshMinutes">{{REFRESH_INTERVAL_LABEL}}</label>
@@ -4386,58 +4428,25 @@ String buildMainPage()
         <span>{{QUIET_HOURS_LABEL}}</span>
         <label class="switch"><input type="checkbox" id="quietEnabled" aria-label="{{QUIET_HOURS_LABEL}}"><span class="slider"></span></label>
       </div>
+      <div id="grpQuiet">
       <label for="quietStart">{{QUIET_FROM_LABEL}}</label>
       <input type="number" id="quietStart" min="0" max="23">
       <label for="quietEnd">{{QUIET_TO_LABEL}}</label>
       <input type="number" id="quietEnd" min="0" max="23">
+      </div>
       <label for="batteryPack">{{BATTERY_PACK_LABEL}}</label>
       <select id="batteryPack">{{BATTERY_PACK_OPTIONS}}</select>
       <div class="sleep-row">
         <span>{{BATTERY_WARN_LABEL}}</span>
         <label class="switch"><input type="checkbox" id="batteryWarnEnabled" aria-label="{{BATTERY_WARN_LABEL}}"><span class="slider"></span></label>
       </div>
+      <div id="grpBatteryWarn">
       <input type="number" id="batteryWarnPercent" min="0" max="100">
+      </div>
       <div class="button-row" style="grid-template-columns:1fr">
         <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
       </div>
       <div id="saveNote" class="sleep-hint"></div>
-    </div>
-    <div class="card">
-      <h2 class="card-title">{{PREVIEW_TITLE}}</h2>
-      <!-- The framebuffer is the panel's native portrait 128x296; rotating here
-           avoids second-guessing the sprite's coordinate mapping on the device. -->
-      <div class="panel-preview"><img id="panelImg" src="/panel.bmp" alt="{{PREVIEW_TITLE}}"></div>
-      <div id="previewNote" class="sleep-hint"></div>
-      <label for="design">{{DESIGN_LABEL}}</label>
-      <select id="design">
-        <option value="classic">{{DESIGN_CLASSIC}}</option>
-        <option value="modern">{{DESIGN_MODERN}}</option>
-      </select>
-      <label for="layout">{{LAYOUT_LABEL}}</label>
-      <select id="layout">
-        <option value="temp">{{LAYOUT_TEMP}}</option>
-        <option value="location">{{LAYOUT_LOCATION}}</option>
-        <option value="both">{{LAYOUT_BOTH}}</option>
-        <option value="info">{{LAYOUT_INFO}}</option>
-      </select>
-      <label for="headerMode">{{HEADER_MODE_LABEL}}</label>
-      <select id="headerMode">
-        <option value="now">{{HEADER_MODE_NOW}}</option>
-        <option value="rain">{{HEADER_MODE_RAIN}}</option>
-        <option value="sun">{{HEADER_MODE_SUN}}</option>
-        <option value="wind">{{HEADER_MODE_WIND}}</option>
-      </select>
-      <label for="headerMode2">{{HEADER_MODE2_LABEL}}</label>
-      <select id="headerMode2">
-        <option value="off">{{MODE_OFF}}</option>
-        <option value="now">{{HEADER_MODE_NOW}}</option>
-        <option value="rain">{{HEADER_MODE_RAIN}}</option>
-        <option value="sun">{{HEADER_MODE_SUN}}</option>
-        <option value="wind">{{HEADER_MODE_WIND}}</option>
-      </select>
-      <div class="button-row" style="grid-template-columns:1fr">
-        <button class="btn-save" onclick="saveSettings()">{{SAVE_BUTTON}}</button>
-      </div>
     </div>
   </div>
     </div>
@@ -4566,6 +4575,7 @@ String buildMainPage()
           : '';
       }
       settingsLoaded = true;
+      updateConditionalFields();
       setIfIdle('unitTemp', status.fahrenheit ? 'f' : 'c');
       setIfIdle('unitWind', status.mph ? 'mph' : 'kmh');
       setIfIdle('quietEnabled', status.quietEnabled);
@@ -4672,6 +4682,37 @@ String buildMainPage()
     }
     // Render the form's current values without saving them. The device draws into
     // its buffer and hands back an image; the display itself is never touched.
+
+    // A rotated element keeps its original layout box, so the container cannot
+    // size itself around it. Measure the card and drive both the scale and the
+    // height from that, so the whole 296x128 panel stays visible at any width.
+    // The previous fixed scale(1.5) overflowed the card and was silently cropped.
+    function fitPreview() {
+      const box = document.querySelector('.panel-preview');
+      const img = document.getElementById('panelImg');
+      if (!box || !img) { return; }
+      const k = box.clientWidth / 296;
+      img.style.transform = `rotate(-90deg) scale(${k})`;
+      box.style.height = Math.round(128 * k) + 'px';
+    }
+    window.addEventListener('resize', fitPreview);
+
+    // Settings that cannot apply right now are hidden rather than left to be
+    // adjusted to no effect: layout and the header lines only shape the classic
+    // design, and the quiet/battery values only matter when their toggle is on.
+    function updateConditionalFields() {
+      const show = (id, on) => {
+        const el = document.getElementById(id);
+        if (el) { el.style.display = on ? '' : 'none'; }
+      };
+      show('grpClassicOnly', document.getElementById('design').value === 'classic');
+      show('grpQuiet', document.getElementById('quietEnabled').checked);
+      show('grpBatteryWarn', document.getElementById('batteryWarnEnabled').checked);
+    }
+    ['design', 'quietEnabled', 'batteryWarnEnabled'].forEach(id => {
+      document.getElementById(id).addEventListener('change', updateConditionalFields);
+    });
+
     function previewSettings() {
       const q = new URLSearchParams({
         design: document.getElementById('design').value,
@@ -4682,6 +4723,7 @@ String buildMainPage()
         t: Date.now()
       });
       document.getElementById('panelImg').src = '/preview.bmp?' + q.toString();
+      fitPreview();
       const note = document.getElementById('previewNote');
       if (note) { note.textContent = ui.previewUnsaved; }
     }
@@ -4708,6 +4750,8 @@ String buildMainPage()
         updateStatus(); startPolling();
       }
     });
+    fitPreview();
+    document.getElementById('panelImg').addEventListener('load', fitPreview);
     startPolling();
   </script>
 </body>
