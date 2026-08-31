@@ -175,13 +175,69 @@ picks the nearest one to whatever you choose — enter 400 for a 400 mAh cell an
 
 ### Measured versus estimated charge
 
-With an **LC709203F** fuel gauge fitted (see [docs/wire-diagram.md](docs/wire-diagram.md)) the
-percentage and voltage are measured, and that is the end of it.
+With an **LC709203F** fuel gauge fitted the percentage and voltage are measured, and that is the end
+of it.
 
 Without one, the firmware *models* the charge from how long it has spent awake and asleep. Modelled
 values always carry a trailing **`?`** so they are never mistaken for measurements. The model cannot
 detect charging, so it needs a zero point: **press "Battery charged" after every charge**. Without
 that press the estimate drifts further from reality with every cycle.
+
+### Optional hardware: Adafruit LC709203F fuel gauge
+
+[Adafruit LiPoly / LiIon Fuel Gauge, product 4712](https://www.adafruit.com/product/4712). An I²C
+part at address `0x0B` that measures the cell directly instead of guessing from run time. The
+display works perfectly well without it — this buys accuracy, not function.
+
+**What it changes**
+
+| | With the gauge | Without it |
+|---|---|---|
+| Percentage | Measured from the cell | Modelled from run time |
+| Voltage | Shown | Not available |
+| Displayed as | `78%` | `78%?` |
+| After a reboot | Keeps counting | Baseline resets |
+| "Battery charged" button | Optional calibration | Required after every charge |
+
+**Fitting it** — four wires, no soldering with a STEMMA QT cable. Full steps in
+[docs/wire-diagram.md](docs/wire-diagram.md).
+
+| Gauge pin | XIAO ESP32‑C6 |
+|---|---|
+| `VIN` | `3V3` |
+| `GND` | `GND` |
+| `SDA` | `D4` (GPIO22) |
+| `SCL` | `D5` (GPIO23) |
+
+The battery plugs into the **gauge**, which passes it through to the driver board. It has to sit in
+line with the pack to measure it — wiring it as a bystander on the I²C bus reads nothing.
+
+Afterwards, set your real pack size under **Settings → Battery size**, then charge the cell fully
+and press **Battery charged** once. That both zeroes the model and re‑seeds the gauge's own state of
+charge from the resting cell voltage.
+
+**Cell type.** `kBatteryProfile` in `include/weather_config.h` must match your battery: `0` for an
+ordinary 3.7 V / 4.2 V LiPo (which includes every cell Adafruit sells, and is the default here), `1`
+only for a 3.8 V / 4.35 V high‑voltage cell. On the wrong profile the gauge maps voltage onto the
+wrong discharge curve, so a full battery never reaches 100 % and everything reads low.
+
+### If the fuel gauge reads wrongly, or not at all
+
+Open **`http://<device-ip>/batteryProbe`**. It scans the I²C bus and reports the gauge's registers,
+which tells you which kind of problem you have:
+
+| Probe says | Meaning | Do this |
+|---|---|---|
+| `scan: (nothing responded)` | Nothing is on the bus | Check `3V3` and `GND`, check `SDA`/`SCL` are not swapped, re‑seat the STEMMA QT cable. **The gauge is powered by the battery — with no pack connected it cannot answer.** |
+| Something answers, but not `0x0b` | A different part, or an address clash | Confirm it is an LC709203F |
+| `ICversion` unexpected | Bus works, data is corrupt | Shorten the wires; check for a bad joint |
+| `cellVoltage: NaN` | Transfer or CRC failure | Usually intermittent wiring |
+| Voltage sensible, percentage far off | Wrong discharge curve | Set `kBatteryProfile` to match the cell |
+| Percentage jumps after each reboot | Charge estimate re‑seeded under load | Press **Battery charged** with the pack full and at rest |
+
+A gauge that answers at boot and then stops is almost always mechanical — a loose lead or a dry
+joint — not firmware. The device logs `Fuel gauge read failed …` on the first failure and falls back
+to the modelled estimate, so the display keeps working (with a `?`) rather than going blank.
 
 ---
 
@@ -198,8 +254,14 @@ that press the estimate drifts further from reality with every cycle.
    # artifact: .pio/build/seeed_xiao_esp32c6/firmware.bin
    ```
 
-2. Open the web page, go to **Firmware Update**, choose the file, press **Upload firmware**.
-3. Watch the progress percentage. The device verifies the image and reboots into it — a ~1.3 MB
+2. **Press reset on the board.** Updates are deliberately something you start, never something
+   the device does on its own — so it has to be awake and listening before you can upload. A
+   reset gives you a 5‑minute window, which is ample. Do not try to catch a scheduled wake
+   instead: those stay up for only 30 seconds and spend about 20 of them redrawing the panel.
+   (If **Keep awake** is already running from the Settings card, skip this — it is already up.)
+
+3. Open the web page, go to **Firmware Update**, choose the file, press **Upload firmware**.
+4. Watch the progress percentage. The device verifies the image and reboots into it — a ~1.3 MB
    image takes about 15 seconds. Deep sleep is suppressed for the whole upload, so it cannot be cut
    short.
 
@@ -266,6 +328,7 @@ Useful for scripting or debugging.
 | GET | `/panel.bmp` | The panel's framebuffer as an image |
 | GET | `/preview.bmp` | Render proposed settings without saving: `?layout=&mode=&mode2=&label=` |
 | GET | `/panelProbe` | Re‑test the panel; reports the BUSY line state |
+| GET | `/batteryProbe` | Scan the I²C bus and dump the fuel gauge's registers |
 | GET | `/scan` | Wi‑Fi scan results |
 | POST | `/update` | Upload firmware (multipart) |
 | POST | `/refresh` | Queue a forecast refresh and redraw |

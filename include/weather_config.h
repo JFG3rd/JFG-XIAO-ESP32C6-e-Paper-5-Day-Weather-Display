@@ -57,6 +57,15 @@ inline constexpr uint16_t kEstimatedSleepUa = 200;
 // use its I2C temperature register instead. Adafruit's 10K NTC is B = 3950.
 inline constexpr uint16_t kBatteryThermistorB = 0;
 
+// Which discharge curve the gauge maps voltage onto.
+//   0 = 3.7 V nominal / 4.2 V charged  <- ordinary LiPo, including Adafruit's
+//   1 = 3.8 V nominal / 4.35 V charged <- high-voltage cells only
+// This must be set explicitly. Adafruit_LC709203F::begin() writes 1 under a
+// comment claiming it is the 4.2 V profile, so a standard cell left on the
+// library default is read against a curve for a pack that charges 150 mV higher:
+// it never reaches 100% and reads low across the whole range.
+inline constexpr uint16_t kBatteryProfile = 0;
+
 // Warn threshold (percent) below which the header glyph turns red.
 inline constexpr uint8_t kBatteryLowPercent = 20;
 

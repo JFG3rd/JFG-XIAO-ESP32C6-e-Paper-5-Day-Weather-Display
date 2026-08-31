@@ -20,6 +20,7 @@
 #include "weather_config.h"
 // 4bpp icon sprites used by the e-paper renderer (indexed color values).
 #include "weather_icons_40x40.h"
+#include "weather_icons_80x80.h"
 
 #ifdef EPAPER_ENABLE
 EPaper epaper;
@@ -204,6 +205,13 @@ bool bootWasCold = true;
 // boot, or when the IP differs from the one last seen. The address is only worth
 // screen space when it is new information.
 bool showNetworkInfo = true;
+// How long the SSID / IP stays on the header after a cold boot, in seconds.
+// 0 = never show it; kNetworkInfoAlways = leave it up for the whole wake cycle.
+constexpr uint16_t kNetworkInfoAlways = 65535;
+uint16_t networkInfoSeconds = 300;
+// Deadline for the above. 0 means "not counting" - either it is not being shown
+// at all, or it is set to stay up.
+uint32_t networkInfoUntilMs = 0;
 uint8_t reconnectFailures = 0;
 uint8_t lastDisconnectReason = 0;
 uint32_t lastScanCacheMs = 0;
@@ -253,6 +261,8 @@ struct ForecastDay
   int tempMax;
   int tempMin;
   int precipitationProbability;
+  // Tenths of a millimetre, so 0.4 mm does not round away to zero.
+  int precipitationMm;
   int windSpeed;
 };
 
@@ -304,6 +314,8 @@ BatteryStatus currentBattery = {};
 // I2C LiPo fuel gauge on D4/D5. See docs/wire-diagram.md.
 Adafruit_LC709203F batteryGauge;
 bool batteryGaugeReady = false;
+// Latches so a gauge that fails every read logs once, not on every poll.
+bool batteryReadFailed = false;
 // False when the panel failed to answer during init; rendering is then skipped
 // so the rest of the firmware (Wi-Fi, web UI) still comes up.
 bool panelReady = false;
@@ -451,6 +463,8 @@ struct UiText
   const char* batteryUnknown;
   const char* sleepModeLabel;
   const char* sleepModeHint;
+  const char* netInfoLabel;
+  const char* netInfoHint;
   const char* weekday[7];
   const char* weatherLabel[17];
 };
@@ -569,6 +583,8 @@ const UiText kUiText[] = {
         "No sensor",
         "Deep sleep between updates",
         "Off keeps this page always reachable.",
+        "Show SSID / IP after boot",
+        "How long the network details hold the header after a power-on or firmware update, before the forecast takes it back.",
         {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"},
         {"SUN", "CLEAR", "PARTLY", "CLOUD", "FOG", "RAIN", "HEAVY", "SHOWERS", "STORM", "DRIZZLE", "SNOW", "MIXED", "SLEET",
          "ICE", "HAIL", "WIND", "WIND+R"},
@@ -686,6 +702,8 @@ const UiText kUiText[] = {
         "Kein Sensor",
         "Tiefschlaf zwischen Updates",
         "Aus haelt diese Seite dauerhaft erreichbar.",
+        "SSID / IP nach dem Start zeigen",
+        "Wie lange die Netzwerkdaten nach dem Einschalten oder einem Firmware-Update in der Kopfzeile bleiben.",
         {"SO", "MO", "DI", "MI", "DO", "FR", "SA"},
         {"SONNE", "KLAR", "TEIL", "WOLKIG", "NEBEL", "REGEN", "STARK", "SCHAUER", "GEWITER", "NIESEL", "SCHNEE", "MIX",
          "GRAUPEL", "EIS", "HAGEL", "WIND", "W+R"},
@@ -803,6 +821,8 @@ const UiText kUiText[] = {
         "Sin sensor",
         "Suspension entre actualizaciones",
         "Desactivado mantiene esta pagina siempre accesible.",
+        "Mostrar SSID / IP tras el arranque",
+        "Cuanto tiempo permanecen los datos de red en la cabecera tras un encendido o una actualizacion.",
         {"DOM", "LUN", "MAR", "MIE", "JUE", "VIE", "SAB"},
         {"SOL", "CLARO", "PARC", "NUBE", "NIEB", "LLUV", "FUERTE", "CHUB", "TORM", "LLOV", "NIEVE", "MIX",
          "SLEET", "HIELO", "GRAN", "VIEN", "V+L"},
@@ -920,6 +940,8 @@ const UiText kUiText[] = {
         "Pas de capteur",
         "Veille profonde entre les mises a jour",
         "Desactive garde cette page toujours accessible.",
+        "Afficher SSID / IP apres le demarrage",
+        "Duree pendant laquelle les infos reseau restent dans l'en-tete apres un demarrage ou une mise a jour.",
         {"DIM", "LUN", "MAR", "MER", "JEU", "VEN", "SAM"},
         {"SOLEIL", "CLAIR", "PART", "NUAGE", "BROU", "PLUIE", "FORT", "AVERS", "ORAGE", "BRUI", "NEIGE", "MIX",
          "SLEET", "GLACE", "GRELE", "VENT", "V+P"},
@@ -1378,6 +1400,10 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
     return false;
   }
 
+  // Read before the loop: the day columns show the amount as well as the
+  // probability, so every day needs its total, not just today.
+  const JsonArray precipitationSum = daily["precipitation_sum"].as<JsonArray>();
+
   snprintf(forecast.location, sizeof(forecast.location), "%s", coordinates.label);
   for (uint8_t i = 0; i < kForecastDays; ++i) {
     snprintf(forecast.days[i].isoDate, sizeof(forecast.days[i].isoDate), "%s", times[i].as<const char*>());
@@ -1386,6 +1412,10 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
     forecast.days[i].tempMax = static_cast<int>(lroundf(tempMax[i].as<float>()));
     forecast.days[i].tempMin = static_cast<int>(lroundf(tempMin[i].as<float>()));
     forecast.days[i].precipitationProbability = precipitation[i].isNull() ? 0 : precipitation[i].as<int>();
+    const bool haveSum = !precipitationSum.isNull() && precipitationSum.size() > i
+                         && !precipitationSum[i].isNull();
+    forecast.days[i].precipitationMm =
+        haveSum ? static_cast<int>(lroundf(precipitationSum[i].as<float>() * 10.0f)) : 0;
     forecast.days[i].windSpeed = static_cast<int>(lroundf(windSpeed[i].as<float>()));
   }
   // Header extras. All optional: a missing field leaves the default, and the
@@ -1394,11 +1424,7 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
   if (!uvIndex.isNull() && uvIndex.size() > 0 && !uvIndex[0].isNull()) {
     forecast.uvIndexMax = static_cast<int>(lroundf(uvIndex[0].as<float>()));
   }
-  const JsonArray precipitationSum = daily["precipitation_sum"].as<JsonArray>();
-  if (!precipitationSum.isNull() && precipitationSum.size() > 0 && !precipitationSum[0].isNull()) {
-    // Tenths of a millimetre, so 0.4 mm does not round away to "0mm".
-    forecast.precipitationMm = static_cast<int>(lroundf(precipitationSum[0].as<float>() * 10.0f));
-  }
+  forecast.precipitationMm = forecast.days[0].precipitationMm;
   const JsonArray gusts = daily["wind_gusts_10m_max"].as<JsonArray>();
   if (!gusts.isNull() && gusts.size() > 0 && !gusts[0].isNull()) {
     forecast.windGusts = static_cast<int>(lroundf(gusts[0].as<float>()));
@@ -1600,39 +1626,21 @@ bool fetchForecast(ForecastData& forecast)
 // The icon data targets the default Seeed_GFX 4-bit palette (white/black/red/yellow).
 // The 4bpp sprite for a day's conditions. Shared by the full-size and reduced
 // icon renderers so the mapping lives in one place.
-const uint8_t* weatherIconData(const ForecastDay& day)
+// Icons are ordered: clear, mostly_clear, partly_cloudy, cloudy, fog,
+// light_rain, heavy_rain, showers, thunderstorm, drizzle, snow,
+// mixed_rain_snow, sleet, freezing_rain, hail, wind, wind_rain. The 40x40 and
+// 80x80 sets share this order, so one classifier feeds both.
+uint8_t weatherIconIndex(const ForecastDay& day)
 {
-  // Icons are ordered left-to-right, top-to-bottom in the 6x3 sprite:
-  // clear, mostly_clear, partly_cloudy, cloudy, fog, light_rain,
-  // heavy_rain, showers, thunderstorm, drizzle, snow, mixed_rain_snow,
-  // sleet, freezing_rain, hail, wind, wind_rain.
-  static const uint8_t* const kWeatherIcon40[] = {
-      kWeatherIcon40Clear,
-      kWeatherIcon40MostlyClear,
-      kWeatherIcon40PartlyCloudy,
-      kWeatherIcon40Cloudy,
-      kWeatherIcon40Fog,
-      kWeatherIcon40LightRain,
-      kWeatherIcon40HeavyRain,
-      kWeatherIcon40Showers,
-      kWeatherIcon40Thunderstorm,
-      kWeatherIcon40Drizzle,
-      kWeatherIcon40Snow,
-      kWeatherIcon40MixedRainSnow,
-      kWeatherIcon40Sleet,
-      kWeatherIcon40FreezingRain,
-      kWeatherIcon40Hail,
-      kWeatherIcon40Wind,
-      kWeatherIcon40WindRain
-  };
-
   uint8_t iconIndex = 3; // default: cloudy
   switch (classifyWeather(day)) {
     case WeatherVisual::Clear:
-      iconIndex = 1;
+      // Clear used to select index 1 and MostlyClear index 0, which showed the
+      // sun-behind-cloud art on a cloudless day and vice versa.
+      iconIndex = 0;
       break;
     case WeatherVisual::MostlyClear:
-      iconIndex = 0;
+      iconIndex = 1;
       break;
     case WeatherVisual::PartlyCloudy:
       iconIndex = 2;
@@ -1681,7 +1689,43 @@ const uint8_t* weatherIconData(const ForecastDay& day)
       break;
   }
 
-  return kWeatherIcon40[iconIndex];
+  return iconIndex;
+}
+
+const uint8_t* weatherIconData(const ForecastDay& day)
+{
+  static const uint8_t* const kWeatherIcon40[] = {
+      kWeatherIcon40Clear,        kWeatherIcon40MostlyClear,
+      kWeatherIcon40PartlyCloudy, kWeatherIcon40Cloudy,
+      kWeatherIcon40Fog,          kWeatherIcon40LightRain,
+      kWeatherIcon40HeavyRain,    kWeatherIcon40Showers,
+      kWeatherIcon40Thunderstorm, kWeatherIcon40Drizzle,
+      kWeatherIcon40Snow,         kWeatherIcon40MixedRainSnow,
+      kWeatherIcon40Sleet,        kWeatherIcon40FreezingRain,
+      kWeatherIcon40Hail,         kWeatherIcon40Wind,
+      kWeatherIcon40WindRain
+  };
+  return kWeatherIcon40[weatherIconIndex(day)];
+}
+
+// The hero draws from art authored at 80x80 rather than from the 40x40 set
+// doubled. Doubling can only preserve detail, never add it; these are drawn at
+// the size they are shown, so the outlines carry a lit rim and the cloud masses
+// have shape that simply does not exist in a 40 px original.
+const uint8_t* weatherIcon80Data(const ForecastDay& day)
+{
+  static const uint8_t* const kWeatherIcon80[] = {
+      kWeatherIcon80Clear,        kWeatherIcon80MostlyClear,
+      kWeatherIcon80PartlyCloudy, kWeatherIcon80Cloudy,
+      kWeatherIcon80Fog,          kWeatherIcon80LightRain,
+      kWeatherIcon80HeavyRain,    kWeatherIcon80Showers,
+      kWeatherIcon80Thunderstorm, kWeatherIcon80Drizzle,
+      kWeatherIcon80Snow,         kWeatherIcon80MixedRainSnow,
+      kWeatherIcon80Sleet,        kWeatherIcon80FreezingRain,
+      kWeatherIcon80Hail,         kWeatherIcon80Wind,
+      kWeatherIcon80WindRain
+  };
+  return kWeatherIcon80[weatherIconIndex(day)];
 }
 
 void drawWeatherIcon(const ForecastDay& day, int16_t centerX, int16_t topY)
@@ -2043,27 +2087,40 @@ void setupBatteryGauge(bool coldBoot)
     return;
   }
 
-  batteryGauge.setPackSize(batteryPackProfile(batteryPackMah));
+  // Every one of these returns a bool that used to be discarded, so a gauge that
+  // answered on the bus but rejected its configuration looked identical to a
+  // healthy one - and then read nonsense.
+  bool configured = batteryGauge.setPackSize(batteryPackProfile(batteryPackMah));
+
+  // The library's begin() writes battery profile 0x01 under a comment claiming it
+  // is "the 4.2V profile". It is not: 0x01 selects 3.8 V nominal / 4.35 V charge
+  // (high-voltage LiPo), and 0x00 is the ordinary 3.7 V / 4.2 V cell. Left alone,
+  // the gauge maps voltage onto an OCV curve for a pack that charges 150 mV higher
+  // than ours, so a full cell never reaches 100% and the whole scale reads low.
+  configured &= batteryGauge.setBattProfile(weather_config::kBatteryProfile);
+
   if (weather_config::kBatteryThermistorB > 0) {
-    batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_THERMISTOR);
-    batteryGauge.setThermistorB(weather_config::kBatteryThermistorB);
+    configured &= batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_THERMISTOR);
+    configured &= batteryGauge.setThermistorB(weather_config::kBatteryThermistorB);
   } else {
     // No NTC on the pack: keep the gauge on its internal I2C temperature register.
-    batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_I2C);
+    // begin() leaves it in thermistor mode, which with no NTC fitted feeds the RSOC
+    // algorithm a garbage temperature.
+    configured &= batteryGauge.setTemperatureMode(LC709203F_TEMPERATURE_I2C);
   }
   // Keep the gauge running between updates. Operating mode costs ~15 uA (versus
   // ~0.2 uA asleep), which is negligible next to the rest of the board, and it
   // lets the RSOC algorithm keep tracking the pack while the MCU is asleep.
-  batteryGauge.setPowerMode(LC709203F_POWER_OPERATE);
+  configured &= batteryGauge.setPowerMode(LC709203F_POWER_OPERATE);
 
-  if (coldBoot) {
-    // Re-seed the charge estimate from the open-circuit voltage. Only on a cold
-    // boot: doing it on every wake would throw away the gauge's own tracking.
-    batteryGauge.initRSOC();
+  if (!configured) {
+    addLog("Battery gauge answered but rejected its configuration; readings suspect.");
   }
 
   batteryGaugeReady = true;
-  addLog(String("Battery gauge ready (IC version 0x") + String(batteryGauge.getICversion(), HEX) + ").");
+  addLog(String("Battery gauge ready (IC version 0x") + String(batteryGauge.getICversion(), HEX) +
+         ", profile " + weather_config::kBatteryProfile + ", APA for " + batteryPackMah + " mAh).");
+  (void)coldBoot;
 }
 
 // Consumed charge since the pack was last marked full, in microamp-hours.
@@ -2185,9 +2242,26 @@ BatteryStatus readBattery()
   const float percent = batteryGauge.cellPercent();
   // A disconnected pack (or a failed transfer) reads as NaN or a nonsense voltage.
   if (isnan(volts) || isnan(percent) || volts < 2.0f || volts > 5.0f) {
+    // Say so, and fall back to the model rather than reporting nothing at all.
+    // This path used to return an all-zero status silently, so a gauge that
+    // stopped answering mid-session showed a blank battery with no reading, no
+    // estimate and not one line in the log to say why.
+    if (!batteryReadFailed) {
+      batteryReadFailed = true;
+      addLog(String("Fuel gauge read failed (volts=") + (isnan(volts) ? String("NaN") : String(volts, 2)) +
+             ", percent=" + (isnan(percent) ? String("NaN") : String(percent, 1)) +
+             "). Falling back to the modelled estimate.");
+    }
+    status.valid = true;
+    status.estimated = true;
+    status.percent = estimatedBatteryPercent();
     return status;
   }
 
+  if (batteryReadFailed) {
+    batteryReadFailed = false;
+    addLog("Fuel gauge reading again.");
+  }
   status.valid = true;
   status.volts = volts;
   status.percent = static_cast<uint8_t>(constrain(percent, 0.0f, 100.0f) + 0.5f);
@@ -2377,7 +2451,9 @@ void renderHeader(const ForecastData& forecast)
   if (batteryIsLow()) {
     // Yellow, not red: red on black is 2.7:1 and barely registers, while yellow
     // on black is 9.3:1 and reads as "attention" anyway.
-    epaper.fillRect(0, kHeaderHeight - 3, displayWidth, 2, TFT_YELLOW);
+    // Flush with the bottom edge. The three text lines now run one pixel further
+    // apart and reach row 27, so the strip has to give up the row it used to sit on.
+    epaper.fillRect(0, kHeaderHeight - 2, displayWidth, 2, TFT_YELLOW);
   }
 
   // The battery glyph owns the far right of the banner; both text lines stop
@@ -2414,8 +2490,12 @@ void renderHeader(const ForecastData& forecast)
     headerLine = buildHeaderPreset(forecast, headerMode);
   }
 
-  // Three 8 px lines, which is what the 26 px banner bought. Clamp against
-  // whatever the layout actually drew on the left, so "info" gets the full width.
+  // Three 8 px lines at y = 0, 10, 20. The banner is 30 px, so 24 px of glyphs
+  // leave 6 spare: two go between each pair of lines and two to the bottom edge,
+  // where the low-battery strip lives. The lines used to sit at 0/9/18 with a
+  // single pixel between them and four unused rows underneath - the spacing was
+  // there to be spent. Clamp against whatever the layout actually drew on the
+  // left, so "info" gets the full width.
   const uint16_t maxWidth = (textRightEdge > leftWidth + 12) ? (textRightEdge - leftWidth - 12) : 0;
 
   lastHeaderLine = headerLine;
@@ -2437,13 +2517,13 @@ void renderHeader(const ForecastData& forecast)
   lastHeaderLine2 = secondLine;
   if (!secondLine.isEmpty()) {
     epaper.setTextColor(TFT_YELLOW, TFT_BLACK);
-    epaper.drawRightString(clampTextToWidth(secondLine, maxWidth, 1), textRightEdge, 9, 1);
+    epaper.drawRightString(clampTextToWidth(secondLine, maxWidth, 1), textRightEdge, 10, 1);
   }
 
   // Line 3: when the panel was last updated.
   const String updatedLabel = String(ui().labelUpdated) + ": " + forecast.updatedDay + " " + forecast.updatedAt;
   epaper.setTextColor(TFT_WHITE, TFT_BLACK);
-  epaper.drawRightString(clampTextToWidth(updatedLabel, maxWidth, 1), textRightEdge, 18, 1);
+  epaper.drawRightString(clampTextToWidth(updatedLabel, maxWidth, 1), textRightEdge, 20, 1);
 }
 
 // Draw a single forecast day card. Layout is tuned to avoid text overlap.
@@ -2454,16 +2534,14 @@ void renderDayCard(const ForecastDay& day, uint16_t x, uint16_t y, uint16_t widt
   epaper.drawRect(x, y, width, height, TFT_BLACK);
 
   // Layout is spaced to prevent overlap between label, icon, and temperatures.
-  const uint16_t dividerY = y + 16;
-  // Position the icon two pixels below the day divider for a tighter layout.
-  const uint16_t iconTop = dividerY - 1;
+  // No rule between the weekday and the icon: the card border already encloses
+  // the day, and the whitespace separates the two well enough without spending a
+  // line of ink to repeat what the box is doing.
+  const uint16_t iconTop = y + 15;
   // The label is below the icon with a small gap, and the temperature is below that.
   const uint16_t labelY = y + 53;
   const uint16_t tempY = y + 70;
 
-  // Black, not yellow: yellow on white measures 1.6:1, so the old divider was
-  // ink spent on something nobody could see.
-  epaper.drawFastHLine(x, dividerY, width, TFT_BLACK);
   drawCenteredText(day.weekday, x + width / 2, y + 2, 2, TFT_BLACK, TFT_WHITE);
   drawWeatherIcon(day, x + width / 2, iconTop);
 
@@ -2488,49 +2566,100 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
   epaper.drawRightString(popLabel, x + width - 4, y, 1);
 }
 
-// Full-screen forecast render. This redraws the full frame (not partial refresh).
-// Draw a weather icon enlarged by an integer factor.
-//
-// Integer scaling only: doubling maps one source pixel to an exact 2x2 block, so
-// edges stay sharp and the four panel colours stay solid. A fractional factor
-// would spread some source pixels over two output pixels and others over one,
-// which on a 4-colour panel with no anti-aliasing reads as a wobble in the
-// outline. Scaling cannot add detail - it can only avoid destroying what is there.
-void drawWeatherIconScaled(const ForecastDay& day, int16_t x, int16_t y, uint8_t scale)
+// The 80x80 hero icon, drawn pixel for pixel - no scaling step at all.
+void drawWeatherIcon80(const ForecastDay& day, int16_t x, int16_t y)
 {
-  const uint8_t* icon = weatherIconData(day);
+  const uint8_t* icon = weatherIcon80Data(day);
   if (icon == nullptr) {
     return;
   }
-  constexpr int16_t kSrc = kWeatherIcon40Width;
-  epaper.fillRect(x, y, kSrc * scale, kWeatherIcon40Height * scale, TFT_WHITE);
-  for (int16_t sy = 0; sy < kWeatherIcon40Height; ++sy) {
-    for (int16_t sx = 0; sx < kSrc; ++sx) {
-      const int32_t index = sy * kSrc + sx;
+  constexpr int16_t kW = kWeatherIcon80Width;
+  epaper.fillRect(x, y, kW, kWeatherIcon80Height, TFT_WHITE);
+  for (int16_t sy = 0; sy < kWeatherIcon80Height; ++sy) {
+    for (int16_t sx = 0; sx < kW; ++sx) {
+      const int32_t index = sy * kW + sx;
       const uint8_t byte = pgm_read_byte(&icon[index / 2]);
       const uint8_t value = (index & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
       if (value == 0x00) {
         continue;  // white: already cleared
       }
-      epaper.fillRect(x + sx * scale, y + sy * scale, scale, scale, value);
+      epaper.drawPixel(x + sx, y + sy, value);
     }
   }
 }
 
-// A vertical bar whose fill height is the precipitation probability. A bar is
-// read at a glance; "P35%" has to be parsed. Yellow fill inside a black outline -
-// yellow alone on white is 1.6:1, but the outline supplies the edge.
-void drawPrecipitationBar(int16_t x, int16_t y, int16_t width, int16_t height, int percent)
+// A vertical bar whose fill height is the forecast rainfall. The probability is
+// printed beside it, so the two elements carry two different facts - the bar used
+// to be filled by probability with the same probability printed next to it, which
+// spent a whole column element restating one number.
+//
+// The scale is fixed rather than fitted to the days on screen. An auto-fitted bar
+// would make the wettest day a full bar whether it is 0.2 mm or 30 mm, so the
+// height would say nothing on its own and would change meaning between refreshes.
+//
+// It is also deliberately non-linear. Daily rainfall is heavily skewed: most wet
+// days are under 5 mm, so a linear 0-30 mm bar would squash every ordinary day
+// into the bottom sixth and spend most of its height on amounts that almost never
+// occur. Each band below gets an equal share of the bar instead, which expands the
+// range that varies day to day and compresses the tail - and because the band
+// boundaries are also the colour changes, the height and the colour always agree.
+//
+// Colour carries the band, which is what lets the bar be read without a unit label
+// anywhere in the column: yellow is a light day, red a wet one, black an
+// exceptional one. The ramp is monotonic in visual weight, which is the most a
+// four-colour panel can express - there is no room for a smooth gradient, and with
+// 18 usable pixels of height a continuous curve would quantise to these steps anyway.
+struct PrecipitationBand
+{
+  int limitTenths;    // upper bound of the band, in tenths of a mm
+  uint16_t colour;
+};
+
+// 0-2 mm, 2-10 mm, 10-30 mm. Anything past 30 mm pins to a full black bar.
+constexpr PrecipitationBand kPrecipitationBands[] = {
+    {20, TFT_YELLOW},
+    {100, TFT_RED},
+    {300, TFT_BLACK},
+};
+constexpr int kPrecipitationBandCount =
+    sizeof(kPrecipitationBands) / sizeof(kPrecipitationBands[0]);
+
+void drawPrecipitationBar(int16_t x, int16_t y, int16_t width, int16_t height, int mmTenths)
 {
   epaper.drawRect(x, y, width, height, TFT_BLACK);
   const int16_t inner = height - 2;
-  int16_t filled = (inner * constrain(percent, 0, 100)) / 100;
-  if (percent > 0 && filled < 1) {
-    filled = 1;  // never render a non-zero chance as empty
+  if (mmTenths <= 0) {
+    return;  // a dry day is an empty outline
   }
-  if (filled > 0) {
-    epaper.fillRect(x + 1, y + height - 1 - filled, width - 2, filled, TFT_YELLOW);
+
+  // Past the last limit the amount pins to the top band. Deriving the lower bound
+  // from the band index rather than carrying it through the loop matters: letting
+  // the loop run off the end leaves it equal to the upper bound, and the zero span
+  // divides by zero on any day over the top threshold.
+  int band = kPrecipitationBandCount - 1;
+  for (int i = 0; i < kPrecipitationBandCount; ++i) {
+    if (mmTenths <= kPrecipitationBands[i].limitTenths) {
+      band = i;
+      break;
+    }
   }
+  const int lower = (band == 0) ? 0 : kPrecipitationBands[band - 1].limitTenths;
+  const int upper = kPrecipitationBands[band].limitTenths;
+
+  // Position within this band, then within the bar: each band owns an equal slice.
+  const int span = upper - lower;
+  const int withinBand = constrain(mmTenths - lower, 0, span);
+  int16_t filled = static_cast<int16_t>(
+      (inner * (static_cast<long>(band) * span + withinBand)) /
+      (static_cast<long>(kPrecipitationBandCount) * span));
+  if (filled < 1) {
+    filled = 1;  // a trace of rain is not the same as a dry day
+  }
+  if (filled > inner) {
+    filled = inner;
+  }
+  epaper.fillRect(x + 1, y + height - 1 - filled, width - 2, filled,
+                  kPrecipitationBands[band].colour);
 }
 
 // The "modern" design: today as a hero panel on the left, the remaining four days
@@ -2585,7 +2714,7 @@ void drawModernForecast(const ForecastData& forecast)
   // the icon the narrow one wasted the space on the element that could not use it.
   // Icon first: it paints a white background, so drawing it after the temperature
   // would erase the degree ring sitting next to it.
-  drawWeatherIconScaled(today, 48, kStripHeight + 4, 2);
+  drawWeatherIcon80(today, 48, kStripHeight + 4);
 
   const String heroTemp = forecast.currentValid ? String(forecast.currentTemp) : String(today.tempMax);
   // Three characters at 18 pt would reach past x=48 and collide with the icon -
@@ -2641,8 +2770,10 @@ void drawModernForecast(const ForecastData& forecast)
     epaper.setTextColor(TFT_BLACK, TFT_WHITE);
     epaper.drawString(String(day.tempMin), cx + 14, kStripHeight + 70, 1);
 
-    // Bar and figure side by side: stacking them spends height restating one fact.
-    drawPrecipitationBar(cx + 4, kStripHeight + 82, 12, 20, day.precipitationProbability);
+    // Bar is how much, figure is how likely. Two facts in the space that used to
+    // hold one twice over.
+    drawPrecipitationBar(cx + 4, kStripHeight + 82, 12, 20, day.precipitationMm);
+    epaper.setTextColor(TFT_BLACK, TFT_WHITE);
     epaper.drawString(String(day.precipitationProbability) + "%", cx + 19, kStripHeight + 88, 1);
   }
 }
@@ -2926,6 +3057,67 @@ bool isPanelDesignSupported(const String& design)
   return design == "classic" || design == "modern";
 }
 
+bool isNetworkInfoSecondsSupported(uint16_t seconds)
+{
+  return seconds == 0 || seconds == 30 || seconds == 60 || seconds == 120 ||
+         seconds == 300 || seconds == 900 || seconds == kNetworkInfoAlways;
+}
+
+// Start (or clear) the window during which the SSID and IP occupy the header.
+// Called on a cold boot and whenever the address changes, since both are moments
+// when someone may be standing there checking the thing actually came up.
+void armNetworkInfo()
+{
+  if (networkInfoSeconds == 0) {
+    showNetworkInfo = false;
+    networkInfoUntilMs = 0;
+    return;
+  }
+  showNetworkInfo = true;
+  networkInfoUntilMs = (networkInfoSeconds == kNetworkInfoAlways)
+                           ? 0
+                           : (millis() + static_cast<uint32_t>(networkInfoSeconds) * 1000UL);
+}
+
+// Drop the network info once its window expires and repaint without it. Returns
+// true if the panel needs redrawing.
+bool expireNetworkInfo()
+{
+  if (!showNetworkInfo || networkInfoUntilMs == 0) {
+    return false;
+  }
+  if (static_cast<int32_t>(millis() - networkInfoUntilMs) < 0) {
+    return false;
+  }
+  showNetworkInfo = false;
+  networkInfoUntilMs = 0;
+  addLog("Network info window expired; showing the forecast header.");
+  return true;
+}
+
+void loadNetworkInfoPreference()
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    return;
+  }
+  const uint16_t stored = preferences.getUShort("netinfo_s", 300);
+  preferences.end();
+  if (isNetworkInfoSecondsSupported(stored)) {
+    networkInfoSeconds = stored;
+  }
+}
+
+void saveNetworkInfoPreference(uint16_t seconds)
+{
+  if (!preferences.begin(kPrefsNamespace, false)) {
+    addLog("Preferences open failed while saving network info duration.");
+    return;
+  }
+  preferences.putUShort("netinfo_s", seconds);
+  preferences.end();
+  networkInfoSeconds = seconds;
+}
+
 void loadHeaderPreference()
 {
   if (!preferences.begin(kPrefsNamespace, false)) {
@@ -3040,8 +3232,10 @@ void noteCurrentIpAddress()
   const String previous = preferences.getString("last_ip", "");
   if (previous != ip) {
     preferences.putString("last_ip", ip);
-    showNetworkInfo = true;
-    addLog(String("IP address changed to ") + ip + "; showing it on the panel this cycle.");
+    preferences.end();
+    armNetworkInfo();
+    addLog(String("IP address changed to ") + ip + "; showing it on the panel.");
+    return;
   }
   preferences.end();
 }
@@ -3240,6 +3434,34 @@ String buildHourOptions(uint8_t selected)
     }
     options += String(hour);
     options += ":00</option>";
+  }
+  return options;
+}
+
+// Options for how long the SSID / IP holds the header after a cold boot.
+String buildNetworkInfoOptions()
+{
+  struct Choice
+  {
+    uint16_t seconds;
+    const char* label;
+  };
+  static const Choice kChoices[] = {
+      {0, "Off - never show"}, {30, "30 seconds"},      {60, "1 minute"},
+      {120, "2 minutes"},      {300, "5 minutes"},      {900, "15 minutes"},
+      {kNetworkInfoAlways, "Until the next sleep"},
+  };
+  String options;
+  for (uint8_t i = 0; i < (sizeof(kChoices) / sizeof(kChoices[0])); ++i) {
+    options += "<option value='";
+    options += String(kChoices[i].seconds);
+    options += "'";
+    if (kChoices[i].seconds == networkInfoSeconds) {
+      options += " selected";
+    }
+    options += ">";
+    options += kChoices[i].label;
+    options += "</option>";
   }
   return options;
 }
@@ -3807,6 +4029,8 @@ String buildStatusJson()
   json += activeWarning.isEmpty() ? "false" : "true";
   json += ",\"showNetworkInfo\":";
   json += showNetworkInfo ? "true" : "false";
+  json += ",\"networkInfoSeconds\":";
+  json += String(networkInfoSeconds);
   json += ",\"design\":\"";
   json += jsonEscape(panelDesign);
   json += "\",\"layout\":\"";
@@ -4203,6 +4427,10 @@ String buildAdvancedPage()
         <button class="btn-nav" onclick="keepAwake(0)">off</button>
       </div>
       <div id="keepAwakeState" class="sleep-hint"></div>
+      <label for="netInfoSeconds">{{NET_INFO_LABEL}}</label>
+      <select id="netInfoSeconds" onchange="setNetworkInfo()">{{NET_INFO_OPTIONS}}</select>
+      <div class="sleep-hint">{{NET_INFO_HINT}}</div>
+      <div id="netInfoState" class="sleep-hint"></div>
       <div class="button-row">
         <button class="btn-nav" onclick="refreshForecast()">{{REFRESH_FORECAST}}</button>
         <button class="btn-danger" onclick="rebootDevice()">{{REBOOT_BUTTON}}</button>
@@ -4287,6 +4515,14 @@ String buildAdvancedPage()
     async function forgetWiFi() {
       if (!confirm('{{CONFIRM_SAVE}}')) { return; }
       alert(await (await fetch('/forgetWiFi', {method: 'POST'})).text());
+    }
+    async function setNetworkInfo() {
+      const seconds = parseInt(document.getElementById('netInfoSeconds').value, 10);
+      const r = await fetch('/networkInfoSeconds', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({seconds})
+      });
+      document.getElementById('netInfoState').textContent = await r.text();
     }
     async function refreshForecast() {
       alert(await (await fetch('/refresh', {method: 'POST'})).text());
@@ -4376,6 +4612,9 @@ String buildAdvancedPage()
   page.replace("{{OTA_BUTTON}}", t.otaButton);
   page.replace("{{SLEEP_MODE_LABEL}}", t.sleepModeLabel);
   page.replace("{{SLEEP_MODE_HINT}}", t.sleepModeHint);
+  page.replace("{{NET_INFO_LABEL}}", t.netInfoLabel);
+  page.replace("{{NET_INFO_HINT}}", t.netInfoHint);
+  page.replace("{{NET_INFO_OPTIONS}}", buildNetworkInfoOptions());
   page.replace("{{KEEP_AWAKE_LABEL}}", t.keepAwakeLabel);
   page.replace("{{CONFIRM_SAVE}}", t.confirmSave);
   const bool connected = (WiFi.status() == WL_CONNECTED);
@@ -4909,6 +5148,9 @@ String buildMainPage()
   page.replace("{{BATTERY_LOW_PERCENT}}", String(weather_config::kBatteryLowPercent));
   page.replace("{{SLEEP_MODE_LABEL}}", t.sleepModeLabel);
   page.replace("{{SLEEP_MODE_HINT}}", t.sleepModeHint);
+  page.replace("{{NET_INFO_LABEL}}", t.netInfoLabel);
+  page.replace("{{NET_INFO_HINT}}", t.netInfoHint);
+  page.replace("{{NET_INFO_OPTIONS}}", buildNetworkInfoOptions());
   page.replace("{{WIFI_SETUP_TITLE}}", t.wifiSetupTitle);
   page.replace("{{LOGS_TITLE}}", t.logsTitle);
   page.replace("{{SSID_LABEL}}", t.ssidLabel);
@@ -5357,6 +5599,146 @@ void handleRefreshInterval()
   saveRefreshPreference(minutes);
   addLog(String("Refresh interval set to ") + minutes + " min.");
   server.send(200, "text/plain", String("Refresh interval set to ") + minutes + " min.");
+}
+
+// On-demand fuel gauge probe. Scans the I2C bus and dumps the gauge's registers
+// raw, so "the battery reading is wrong" can be answered with evidence instead of
+// inference: whether anything answers at 0x0B at all separates a wiring fault from
+// a configuration fault, and the register values show which.
+void handleBatteryProbe()
+{
+  noteWebActivity();
+  String out;
+
+  if (!weather_config::kBatteryGaugeEnabled) {
+    server.send(200, "text/plain", "Fuel gauge support is disabled in weather_config.h.\n");
+    return;
+  }
+
+  // GPIO numbers, not board labels: kBatterySdaPin is the D4 macro, which expands
+  // to GPIO22, so printing it as "D22" names a pin that does not exist.
+  out += "I2C bus: SDA=GPIO" + String(weather_config::kBatterySdaPin) +
+         " SCL=GPIO" + String(weather_config::kBatterySclPin) +
+         "  (kBatterySdaPin / kBatterySclPin in weather_config.h)\n";
+
+  // Scan first. A silent bus is a wiring or power fault and nothing below it
+  // will mean anything; a device at some other address means the wrong part.
+  // Report whether the peripheral even came up - if Wire.begin() fails, every
+  // address looks silent for a reason that has nothing to do with the wiring.
+  const bool wireUp = Wire.begin(weather_config::kBatterySdaPin, weather_config::kBatterySclPin);
+  out += "Wire.begin: " + String(wireUp ? "ok" : "FAILED (peripheral did not start)") + "\n";
+
+  int found = 0;
+  out += "scan: ";
+  for (uint8_t addr = 1; addr < 127; ++addr) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      out += "0x" + String(addr, HEX) + " ";
+      ++found;
+    }
+  }
+  if (found == 0) {
+    out += "(nothing responded)";
+  }
+  out += "\n";
+  out += "expected: 0x0b (LC709203F)\n\n";
+
+  if (found == 0) {
+    // Nothing on the configured pins. Before blaming the hardware, check whether
+    // the gauge is simply on different pins - swapped SDA/SCL is the single most
+    // common way to wire this, and it looks identical to a dead device from here.
+    //
+    // Every exposed pin, D0-D10. D0-D3 and D8-D10 also drive the panel, so this
+    // briefly toggles its SPI and reset lines - harmless, but it can leave the
+    // display showing rubbish, so a refresh is requested afterwards. Locating a
+    // miswired gauge is worth one redraw.
+    static const uint8_t kPins[] = {D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10};
+    constexpr uint8_t kPinCount = sizeof(kPins) / sizeof(kPins[0]);
+    out += "Sweeping every exposed pin (D0-D10) for a device at 0x0b:\n";
+    bool foundElsewhere = false;
+    for (uint8_t i = 0; i < kPinCount; ++i) {
+      for (uint8_t j = 0; j < kPinCount; ++j) {
+        if (i == j) {
+          continue;
+        }
+        Wire.end();
+        if (!Wire.begin(kPins[i], kPins[j])) {
+          continue;
+        }
+        Wire.beginTransmission(0x0B);
+        if (Wire.endTransmission() != 0) {
+          continue;
+        }
+        // An address ACK alone is not proof. Several of these pins are driven by
+        // the panel, and a line held low reads as a device acknowledging, because
+        // "ACK" is just SDA being low at the right moment. Read the IC version
+        // register and check it: a real LC709203F answers 0x2AFF.
+        uint8_t buf[3] = {0, 0, 0};
+        Wire.beginTransmission(0x0B);
+        Wire.write(0x11);  // IC version
+        const bool wrote = (Wire.endTransmission(false) == 0);
+        const uint8_t got = wrote ? Wire.requestFrom((uint8_t)0x0B, (uint8_t)3) : 0;
+        for (uint8_t k = 0; k < got && k < 3; ++k) {
+          buf[k] = Wire.read();
+        }
+        const uint16_t version = (uint16_t)buf[1] << 8 | buf[0];
+        out += "  ack at SDA=GPIO" + String(kPins[i]) + " SCL=GPIO" + String(kPins[j]) +
+               " -> IC version 0x" + String(version, HEX);
+        if (version == 0x2AFF) {
+          out += "  <- REAL GAUGE\n";
+          foundElsewhere = true;
+        } else {
+          out += "  (not a gauge - line stuck, false ack)\n";
+        }
+      }
+    }
+    Wire.end();
+    Wire.begin(weather_config::kBatterySdaPin, weather_config::kBatterySclPin);
+    requestRefresh();  // the sweep touched the panel's pins; repaint it
+
+    if (foundElsewhere) {
+      out += "\nThe gauge is wired to different pins than the firmware expects.\n";
+      out += "Either move the wires, or set kBatterySdaPin / kBatterySclPin to match.\n";
+    } else {
+      out += "  nothing on any free pin pair\n\n";
+      out += "No I2C device anywhere reachable. Check in this order:\n";
+      out += "  1. GND between the gauge and the XIAO - a missing ground is silent, not noisy.\n";
+      out += "  2. The gauge's VIN to 3V3.\n";
+      out += "  3. SDA and SCL actually landing on D4 and D5 on the header.\n";
+      out += "A lit LED only proves the gauge has power, not that the data pins are connected.\n";
+    }
+    server.send(200, "text/plain", out);
+    return;
+  }
+
+  out += "gaugeReady: " + String(batteryGaugeReady ? "yes" : "no") + "\n";
+  if (!batteryGaugeReady) {
+    out += "begin() failed at boot - reboot with the gauge attached to retry.\n";
+    server.send(200, "text/plain", out);
+    return;
+  }
+
+  const uint16_t ic = batteryGauge.getICversion();
+  const float volts = batteryGauge.cellVoltage();
+  const float pct = batteryGauge.cellPercent();
+  out += "ICversion: 0x" + String(ic, HEX) + (ic == 0x2AFF ? "  (expected)" : "  (UNEXPECTED - expected 0x2aff)") + "\n";
+  out += "cellVoltage: " + (isnan(volts) ? String("NaN  <- read failed (I2C or CRC)") : String(volts, 3) + " V") + "\n";
+  out += "cellPercent: " + (isnan(pct) ? String("NaN  <- read failed (I2C or CRC)") : String(pct, 1) + " %") + "\n";
+  out += "configured profile: " + String(weather_config::kBatteryProfile) +
+         (weather_config::kBatteryProfile == 0 ? "  (3.7V nominal / 4.2V full)" : "  (3.8V nominal / 4.35V full)") + "\n";
+  out += "configured pack: " + String(batteryPackMah) + " mAh\n";
+  out += "thermistor B: " + String(weather_config::kBatteryThermistorB) +
+         (weather_config::kBatteryThermistorB == 0 ? "  (none; using I2C temperature)" : "") + "\n";
+
+  if (!isnan(volts) && !isnan(pct)) {
+    out += "\nSanity check - for a 3.7V/4.2V cell, roughly:\n";
+    out += "  4.15 V ~ 100%   3.95 V ~ 75%   3.85 V ~ 55%   3.75 V ~ 35%   3.5 V ~ 10%\n";
+    out += "If the percentage reads far below what the voltage suggests, the gauge is\n";
+    out += "on the wrong battery profile. If it is erratic between reboots, the state\n";
+    out += "of charge is being re-seeded under load rather than at rest.\n";
+  }
+
+  server.send(200, "text/plain", out);
 }
 
 // Fast, on-demand panel probe. Re-runs a reset and reports the BUSY line state
@@ -5833,9 +6215,51 @@ void handleBatteryFull()
 {
   noteWebActivity();
   resetConsumedCharge();
+  // Also re-seed the gauge's own state of charge from the pack's open-circuit
+  // voltage. This used to run on every cold boot, which was wrong twice over:
+  // the seed assumes a pack at rest, so doing it while Wi-Fi and the panel are
+  // drawing current reads the sagged voltage as a flat battery, and every reset
+  // threw away the tracking the gauge had accumulated. Hence the percentage
+  // jumping between reboots. Here it is a deliberate calibration: the user is
+  // telling us the pack is full, which is exactly when a re-seed is meaningful.
+  if (batteryGaugeReady) {
+    if (batteryGauge.initRSOC()) {
+      addLog("Fuel gauge state of charge re-seeded from cell voltage.");
+    } else {
+      addLog("Fuel gauge did not accept the re-seed command.");
+    }
+  }
   currentBattery = readBattery();
   addLog("Battery marked as fully charged; estimate reset to 100%.");
   server.send(200, "text/plain", "Battery estimate reset to 100%.");
+}
+
+void handleNetworkInfoSeconds()
+{
+  noteWebActivity();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  const uint16_t seconds = doc["seconds"] | 0;
+  if (!isNetworkInfoSecondsSupported(seconds)) {
+    server.send(400, "text/plain", "Unsupported duration");
+    return;
+  }
+
+  saveNetworkInfoPreference(seconds);
+  // Re-arm against the new value if it is currently on screen, so shortening the
+  // window takes effect now rather than at the next boot.
+  if (showNetworkInfo) {
+    armNetworkInfo();
+    requestRefresh();
+  }
+  const String text = (seconds == 0)                   ? String("Network info hidden on boot.")
+                      : (seconds == kNetworkInfoAlways) ? String("Network info stays on the header.")
+                                                        : String("Network info shown for ") + seconds + " s after boot.";
+  addLog(text);
+  server.send(200, "text/plain", text);
 }
 
 void handleReboot()
@@ -5940,10 +6364,12 @@ void setupWebServer()
   server.on("/design", HTTP_POST, handleDesign);
   server.on("/batteryPack", HTTP_POST, handleBatteryPack);
   server.on("/keepAwake", HTTP_POST, handleKeepAwake);
+  server.on("/networkInfoSeconds", HTTP_POST, handleNetworkInfoSeconds);
   server.on("/panel.bmp", HTTP_GET, handlePanelBitmap);
   server.on("/preview.bmp", HTTP_GET, handlePreviewBitmap);
   server.on("/batteryFull", HTTP_POST, handleBatteryFull);
   server.on("/panelProbe", HTTP_GET, handlePanelProbe);
+  server.on("/batteryProbe", HTTP_GET, handleBatteryProbe);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.onNotFound(handleNotFound);
@@ -5999,6 +6425,19 @@ void setupRuntime()
   loadPowerPreferences();
   loadWarningPreference();
   loadHeaderPreference();
+
+  // A cold boot returns the panel to the classic design. A power-on or a firmware
+  // update is a "start from a known state" moment, and the five equal day cards
+  // are that state. This has to run after loadHeaderPreference(), which is what
+  // reads the stored design - doing it earlier would compare against the initial
+  // value and then be overwritten by the load.
+  //
+  // Persisted rather than held in RAM, so the web page agrees with the panel
+  // instead of offering a setting that no longer matches what is on screen.
+  if (bootWasCold && panelDesign != "classic") {
+    savePanelDesignPreference("classic");
+    addLog("Cold boot: panel design reset to classic.");
+  }
   loadBatteryPackPreference();
   loadConsumedCharge();
   loadStaticIpConfig();
@@ -6043,7 +6482,25 @@ void setup()
 
   if (coldBoot) {
     rtcWakeCount = 0;
-    addLog("JFG PaperCast booting.");
+    // Why the chip restarted, not just that it did. A cold boot is otherwise
+    // indistinguishable between someone pressing reset, the regulator browning
+    // out under the panel's refresh current, and firmware crashing or hanging -
+    // which need completely different fixes.
+    const char* cause = "unknown";
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON:  cause = "power-on"; break;
+      case ESP_RST_EXT:      cause = "external reset pin"; break;
+      case ESP_RST_SW:       cause = "software restart"; break;
+      case ESP_RST_PANIC:    cause = "CRASH (panic/exception)"; break;
+      case ESP_RST_INT_WDT:  cause = "interrupt watchdog"; break;
+      case ESP_RST_TASK_WDT: cause = "task watchdog"; break;
+      case ESP_RST_WDT:      cause = "other watchdog"; break;
+      case ESP_RST_BROWNOUT: cause = "BROWNOUT (supply sagged)"; break;
+      case ESP_RST_DEEPSLEEP: cause = "deep sleep wake"; break;
+      case ESP_RST_SDIO:     cause = "SDIO"; break;
+      default: break;
+    }
+    addLog(String("JFG PaperCast booting. Reset reason: ") + cause);
   } else {
     ++rtcWakeCount;
     addLog(String("Woke from deep sleep (cycle ") + rtcWakeCount + ").");
@@ -6054,10 +6511,18 @@ void setup()
   extendAwakeWindow(coldBoot ? kColdBootAwakeMs : kAwakeWindowMs);
 
   // Show SSID/IP on the panel after a power-on or reset - that is when someone is
-  // standing there checking it worked. A timer wake starts with it hidden, and
+  // standing there checking it worked - then hand the header back to the forecast
+  // after the configured window. A timer wake starts with it hidden, and
   // noteCurrentIpAddress() turns it back on if the address actually moved.
   bootWasCold = coldBoot;
-  showNetworkInfo = coldBoot;
+  loadNetworkInfoPreference();
+  if (coldBoot) {
+    armNetworkInfo();
+  } else {
+    showNetworkInfo = false;
+    networkInfoUntilMs = 0;
+  }
+
   setupBatteryGauge(coldBoot);
   setupRuntime();
 }
@@ -6106,6 +6571,11 @@ void loop()
   if (refreshPending && (millis() - refreshRequestedMs) > kRefreshDebounceMs) {
     refreshPending = false;
     refreshForecastAndDisplay();
+  }
+
+  // Hand the header back to the forecast once the network-info window is up.
+  if (expireNetworkInfo()) {
+    requestRefresh();
   }
 
   // Sleep once the awake window expires, or unconditionally once the cap is hit

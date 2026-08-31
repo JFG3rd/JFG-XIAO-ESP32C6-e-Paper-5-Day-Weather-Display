@@ -20,6 +20,49 @@ This project focuses on a reliable, repeatable workflow: correct controller sele
 - **Driver Board**: Seeed Studio XIAO ePaper driver board / expansion board V2  
 - **Panel**: 2.9" BWRY e‑paper, 128×296  
 
+### Optional: Adafruit LC709203F fuel gauge
+
+A [LiPoly / LiIon fuel gauge breakout](https://www.adafruit.com/product/4712) (I²C, address `0x0B`)
+that reports the pack's true voltage and state of charge. **Entirely optional** — without one the
+firmware models the charge from how long it has spent awake and asleep, and marks every such reading
+with a trailing `?` so a guess never masquerades as a measurement.
+
+| | With the gauge | Without it |
+|---|---|---|
+| Percentage | Measured from the cell | Modelled from run time |
+| Voltage | Reported | Not available |
+| Shown as | `78%` | `78%?` |
+| Survives a reboot | Yes — the gauge keeps counting | Resets its baseline |
+
+![The gauge fitted, in line with the pack](docs/images/IMG_3211.jpeg)
+
+Four wires to the XIAO, no soldering if you use a STEMMA QT cable. See
+[`docs/wire-diagram.md`](docs/wire-diagram.md) for the step‑by‑step. Note in the photo
+that the cell plugs into the **gauge**, and a second lead carries it on to the driver
+board's `BAT` connector — the gauge has to sit in line with the pack to measure it.
+
+| Gauge | XIAO ESP32‑C6 |
+|---|---|
+| `VIN` | `3V3` |
+| `GND` | `GND` |
+| `SDA` | `D4` (GPIO22) |
+| `SCL` | `D5` (GPIO23) |
+
+The battery connects to the **gauge**, and the gauge passes it through to the driver board — it has
+to sit in line with the pack to measure it. Set your real pack size on the web page (**Settings →
+Battery size**); the relevant firmware settings are `kBatteryGaugeEnabled`, `kBatteryProfile` and
+`kBatteryThermistorB` in [`include/weather_config.h`](include/weather_config.h).
+
+> **Set `kBatteryProfile` to match your cell.** `0` is an ordinary 3.7 V / 4.2 V LiPo — including
+> every cell Adafruit sells — and `1` is a 3.8 V / 4.35 V high‑voltage cell. The Adafruit library's
+> own `begin()` writes `1` under a comment claiming it is the 4.2 V profile, so a standard cell left
+> on the library default is measured against a curve for a pack that charges 150 mV higher: it never
+> reaches 100 % and reads low across the whole range. This firmware sets the profile explicitly.
+
+**If the readings look wrong**, open `http://<device-ip>/batteryProbe`. It scans the I²C bus and
+dumps the gauge's registers, which separates a wiring fault (nothing answers) from a configuration
+fault (it answers, but with implausible numbers).
+
 ## Software Stack
 
 - PlatformIO
@@ -101,13 +144,47 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 - 5‑day forecast layout
 - Bold max temperature
 - Compact legend (L = low, P = precipitation **probability**)
-- Weather icons (40×40 sprites, 4bpp palette)
+- Weather icons in a single hand-authored four-colour set, at 80×80 and 40×40
 - **Four selectable header layouts**: large current temperature, city name, both, or neither
 - **Two configurable information lines** — feels‑like + UV, rain in mm, sunrise/sunset, or wind +
   gusts. The first line yields to a weather warning, or to the IP address after a cold boot
 - **Weather warnings** — derived from the forecast, or official DWD warnings via Bright Sky
 - Battery indicator with the charge percentage inside it, and a red strip when it runs low
 - Auto refresh on a configurable interval (default 60 minutes), deep sleeping in between
+
+### Display designs
+
+Two complete designs ship in the firmware. Pick one from **Display** on the web page; the preview
+updates as you choose, so you can compare them before saving. Both are real screenshots taken from
+the device over `/preview.bmp`.
+
+**Modern** — today as a hero panel, the rest of the week compact beside it:
+
+![Modern design](docs/images/design-modern.png)
+
+The hero answers "what is it doing right now" without reading anything: an 80×80 icon, the current
+temperature, and the day's high and low. The status strip carries the location, the update time and
+the battery — and turns yellow with black text when a warning is active. Each day column pairs a
+precipitation **bar** with the **probability** beside it, so the two elements carry two different
+facts rather than restating one.
+
+**Classic** — five equal day cards under a configurable banner:
+
+![Classic design](docs/images/design-classic.png)
+
+Every day gets the same treatment, which is the better choice if you read the whole week rather than
+mostly glancing at today. The banner above it is configurable in the ways described below.
+
+| | Modern | Classic |
+|---|---|---|
+| Today | Hero panel, 80×80 icon | One card among five |
+| Remaining days | 4 compact columns | 4 equal cards |
+| Precipitation | Bar = amount, figure = probability | Text, `P70%` |
+| Banner layouts / presets | Not used — the hero shows more than a preset could | Fully configurable |
+| Best for | Glancing at today | Reading the week |
+
+> The **layout** and **information line** selectors below shape the *classic* banner only. They are
+> hidden when the modern design is selected, because the hero already shows more than any preset.
 
 ### Display layouts
 
@@ -292,7 +369,48 @@ The configuration is stored in NVS and applied on each connection.
 
 ## Weather Icons (4bpp)
 
-Icons are stored as 4‑bit indexed sprites and rendered with:
+Seventeen conditions, drawn for this panel's four colours. The set exists at two sizes — 80×80 for
+the modern hero, 40×40 for the day columns of both designs:
+
+![80×80 icon set](docs/images/icons-80x80.png)
+
+![40×40 icon set](docs/images/icons-40x40.png)
+
+**The two sizes are the same drawing code run at two scales, not one resampled into the other.** A
+2:1 downsample on a palette with no intermediate tones has to decide each output pixel by a block
+vote, which either eats the one-pixel outlines or doubles their weight — there is no anti-aliasing
+to absorb the difference. Redrawing at 40 keeps a true single-pixel outline.
+
+**The style**, and why it is what it is with four inks:
+
+- **White body, black outline, and a lit rim** — a second copy of the shape offset up and left, with
+  the white body drawn over it, leaving a crescent. With no intermediate tones that crescent is the
+  only way to suggest a light source at all.
+- **Rain is black; red means take notice.** Red is reserved for heavy precipitation, storms, hail and
+  freezing rain, so it keeps the same meaning it has in the warning strip and the low-battery
+  marker. Rendering every drizzle in red would spend that signal on nothing.
+- **Yellow is sunlight**, on the sun itself and on the lit rim of a cloud with sun behind it.
+
+### Regenerating them
+
+The icons are generated, not hand-edited. Edit [`tools/gen_icons80.py`](tools/gen_icons80.py) and run:
+
+```bash
+python3 tools/gen_icons80.py     # no dependencies, pure standard library
+```
+
+It rewrites both headers and both preview images. Icons are authored in an 80-unit design space and
+the primitives convert to pixels, which is what lets one definition serve both sizes.
+
+The generator **reports any icon that draws outside its tile** rather than letting it be silently
+truncated. This matters more than it sounds: a cloud's true extent is larger than its nominal size,
+because the outline grows outward and the lit rim sits further up-left again, so art that looks
+safely inside the tile in source coordinates can still lose its crown. Both sizes must report
+`no clipping` before the output is worth flashing.
+
+### Format
+
+4‑bit indexed sprites, two pixels per byte, high nibble first, rendered with:
 
 ```cpp
 epaper.fillRect(x, y, 40, 40, TFT_WHITE);
@@ -329,9 +447,11 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 ```
 .
 ├── src/                     # main app
-├── include/                 # icon headers, config
+├── include/                 # generated icon headers, config
 ├── lib/Seeed_GFX/           # graphics + driver stack
+├── tools/gen_icons80.py     # draws the icon set; rewrites both headers
 ├── docs/                    # detailed guides
+├── docs/images/             # screenshots and icon sheets used by this README
 ├── assets/                  # source images for icons
 ├── platformio.ini
 └── partitions_singleapp.csv
