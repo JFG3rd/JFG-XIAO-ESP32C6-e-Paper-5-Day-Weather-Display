@@ -20,6 +20,7 @@
 #include "weather_config.h"
 // 4bpp icon sprites used by the e-paper renderer (indexed color values).
 #include "weather_icons_40x40.h"
+#include "weather_icons_80x80.h"
 
 #ifdef EPAPER_ENABLE
 EPaper epaper;
@@ -253,6 +254,8 @@ struct ForecastDay
   int tempMax;
   int tempMin;
   int precipitationProbability;
+  // Tenths of a millimetre, so 0.4 mm does not round away to zero.
+  int precipitationMm;
   int windSpeed;
 };
 
@@ -1378,6 +1381,10 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
     return false;
   }
 
+  // Read before the loop: the day columns show the amount as well as the
+  // probability, so every day needs its total, not just today.
+  const JsonArray precipitationSum = daily["precipitation_sum"].as<JsonArray>();
+
   snprintf(forecast.location, sizeof(forecast.location), "%s", coordinates.label);
   for (uint8_t i = 0; i < kForecastDays; ++i) {
     snprintf(forecast.days[i].isoDate, sizeof(forecast.days[i].isoDate), "%s", times[i].as<const char*>());
@@ -1386,6 +1393,10 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
     forecast.days[i].tempMax = static_cast<int>(lroundf(tempMax[i].as<float>()));
     forecast.days[i].tempMin = static_cast<int>(lroundf(tempMin[i].as<float>()));
     forecast.days[i].precipitationProbability = precipitation[i].isNull() ? 0 : precipitation[i].as<int>();
+    const bool haveSum = !precipitationSum.isNull() && precipitationSum.size() > i
+                         && !precipitationSum[i].isNull();
+    forecast.days[i].precipitationMm =
+        haveSum ? static_cast<int>(lroundf(precipitationSum[i].as<float>() * 10.0f)) : 0;
     forecast.days[i].windSpeed = static_cast<int>(lroundf(windSpeed[i].as<float>()));
   }
   // Header extras. All optional: a missing field leaves the default, and the
@@ -1394,11 +1405,7 @@ bool parseForecastPayload(const String& payload, const Coordinates& coordinates,
   if (!uvIndex.isNull() && uvIndex.size() > 0 && !uvIndex[0].isNull()) {
     forecast.uvIndexMax = static_cast<int>(lroundf(uvIndex[0].as<float>()));
   }
-  const JsonArray precipitationSum = daily["precipitation_sum"].as<JsonArray>();
-  if (!precipitationSum.isNull() && precipitationSum.size() > 0 && !precipitationSum[0].isNull()) {
-    // Tenths of a millimetre, so 0.4 mm does not round away to "0mm".
-    forecast.precipitationMm = static_cast<int>(lroundf(precipitationSum[0].as<float>() * 10.0f));
-  }
+  forecast.precipitationMm = forecast.days[0].precipitationMm;
   const JsonArray gusts = daily["wind_gusts_10m_max"].as<JsonArray>();
   if (!gusts.isNull() && gusts.size() > 0 && !gusts[0].isNull()) {
     forecast.windGusts = static_cast<int>(lroundf(gusts[0].as<float>()));
@@ -1600,39 +1607,21 @@ bool fetchForecast(ForecastData& forecast)
 // The icon data targets the default Seeed_GFX 4-bit palette (white/black/red/yellow).
 // The 4bpp sprite for a day's conditions. Shared by the full-size and reduced
 // icon renderers so the mapping lives in one place.
-const uint8_t* weatherIconData(const ForecastDay& day)
+// Icons are ordered: clear, mostly_clear, partly_cloudy, cloudy, fog,
+// light_rain, heavy_rain, showers, thunderstorm, drizzle, snow,
+// mixed_rain_snow, sleet, freezing_rain, hail, wind, wind_rain. The 40x40 and
+// 80x80 sets share this order, so one classifier feeds both.
+uint8_t weatherIconIndex(const ForecastDay& day)
 {
-  // Icons are ordered left-to-right, top-to-bottom in the 6x3 sprite:
-  // clear, mostly_clear, partly_cloudy, cloudy, fog, light_rain,
-  // heavy_rain, showers, thunderstorm, drizzle, snow, mixed_rain_snow,
-  // sleet, freezing_rain, hail, wind, wind_rain.
-  static const uint8_t* const kWeatherIcon40[] = {
-      kWeatherIcon40Clear,
-      kWeatherIcon40MostlyClear,
-      kWeatherIcon40PartlyCloudy,
-      kWeatherIcon40Cloudy,
-      kWeatherIcon40Fog,
-      kWeatherIcon40LightRain,
-      kWeatherIcon40HeavyRain,
-      kWeatherIcon40Showers,
-      kWeatherIcon40Thunderstorm,
-      kWeatherIcon40Drizzle,
-      kWeatherIcon40Snow,
-      kWeatherIcon40MixedRainSnow,
-      kWeatherIcon40Sleet,
-      kWeatherIcon40FreezingRain,
-      kWeatherIcon40Hail,
-      kWeatherIcon40Wind,
-      kWeatherIcon40WindRain
-  };
-
   uint8_t iconIndex = 3; // default: cloudy
   switch (classifyWeather(day)) {
     case WeatherVisual::Clear:
-      iconIndex = 1;
+      // Clear used to select index 1 and MostlyClear index 0, which showed the
+      // sun-behind-cloud art on a cloudless day and vice versa.
+      iconIndex = 0;
       break;
     case WeatherVisual::MostlyClear:
-      iconIndex = 0;
+      iconIndex = 1;
       break;
     case WeatherVisual::PartlyCloudy:
       iconIndex = 2;
@@ -1681,7 +1670,43 @@ const uint8_t* weatherIconData(const ForecastDay& day)
       break;
   }
 
-  return kWeatherIcon40[iconIndex];
+  return iconIndex;
+}
+
+const uint8_t* weatherIconData(const ForecastDay& day)
+{
+  static const uint8_t* const kWeatherIcon40[] = {
+      kWeatherIcon40Clear,        kWeatherIcon40MostlyClear,
+      kWeatherIcon40PartlyCloudy, kWeatherIcon40Cloudy,
+      kWeatherIcon40Fog,          kWeatherIcon40LightRain,
+      kWeatherIcon40HeavyRain,    kWeatherIcon40Showers,
+      kWeatherIcon40Thunderstorm, kWeatherIcon40Drizzle,
+      kWeatherIcon40Snow,         kWeatherIcon40MixedRainSnow,
+      kWeatherIcon40Sleet,        kWeatherIcon40FreezingRain,
+      kWeatherIcon40Hail,         kWeatherIcon40Wind,
+      kWeatherIcon40WindRain
+  };
+  return kWeatherIcon40[weatherIconIndex(day)];
+}
+
+// The hero draws from art authored at 80x80 rather than from the 40x40 set
+// doubled. Doubling can only preserve detail, never add it; these are drawn at
+// the size they are shown, so the outlines carry a lit rim and the cloud masses
+// have shape that simply does not exist in a 40 px original.
+const uint8_t* weatherIcon80Data(const ForecastDay& day)
+{
+  static const uint8_t* const kWeatherIcon80[] = {
+      kWeatherIcon80Clear,        kWeatherIcon80MostlyClear,
+      kWeatherIcon80PartlyCloudy, kWeatherIcon80Cloudy,
+      kWeatherIcon80Fog,          kWeatherIcon80LightRain,
+      kWeatherIcon80HeavyRain,    kWeatherIcon80Showers,
+      kWeatherIcon80Thunderstorm, kWeatherIcon80Drizzle,
+      kWeatherIcon80Snow,         kWeatherIcon80MixedRainSnow,
+      kWeatherIcon80Sleet,        kWeatherIcon80FreezingRain,
+      kWeatherIcon80Hail,         kWeatherIcon80Wind,
+      kWeatherIcon80WindRain
+  };
+  return kWeatherIcon80[weatherIconIndex(day)];
 }
 
 void drawWeatherIcon(const ForecastDay& day, int16_t centerX, int16_t topY)
@@ -2488,49 +2513,100 @@ void renderFooterMetrics(const ForecastDay& day, uint16_t x, uint16_t y, uint16_
   epaper.drawRightString(popLabel, x + width - 4, y, 1);
 }
 
-// Full-screen forecast render. This redraws the full frame (not partial refresh).
-// Draw a weather icon enlarged by an integer factor.
-//
-// Integer scaling only: doubling maps one source pixel to an exact 2x2 block, so
-// edges stay sharp and the four panel colours stay solid. A fractional factor
-// would spread some source pixels over two output pixels and others over one,
-// which on a 4-colour panel with no anti-aliasing reads as a wobble in the
-// outline. Scaling cannot add detail - it can only avoid destroying what is there.
-void drawWeatherIconScaled(const ForecastDay& day, int16_t x, int16_t y, uint8_t scale)
+// The 80x80 hero icon, drawn pixel for pixel - no scaling step at all.
+void drawWeatherIcon80(const ForecastDay& day, int16_t x, int16_t y)
 {
-  const uint8_t* icon = weatherIconData(day);
+  const uint8_t* icon = weatherIcon80Data(day);
   if (icon == nullptr) {
     return;
   }
-  constexpr int16_t kSrc = kWeatherIcon40Width;
-  epaper.fillRect(x, y, kSrc * scale, kWeatherIcon40Height * scale, TFT_WHITE);
-  for (int16_t sy = 0; sy < kWeatherIcon40Height; ++sy) {
-    for (int16_t sx = 0; sx < kSrc; ++sx) {
-      const int32_t index = sy * kSrc + sx;
+  constexpr int16_t kW = kWeatherIcon80Width;
+  epaper.fillRect(x, y, kW, kWeatherIcon80Height, TFT_WHITE);
+  for (int16_t sy = 0; sy < kWeatherIcon80Height; ++sy) {
+    for (int16_t sx = 0; sx < kW; ++sx) {
+      const int32_t index = sy * kW + sx;
       const uint8_t byte = pgm_read_byte(&icon[index / 2]);
       const uint8_t value = (index & 1) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
       if (value == 0x00) {
         continue;  // white: already cleared
       }
-      epaper.fillRect(x + sx * scale, y + sy * scale, scale, scale, value);
+      epaper.drawPixel(x + sx, y + sy, value);
     }
   }
 }
 
-// A vertical bar whose fill height is the precipitation probability. A bar is
-// read at a glance; "P35%" has to be parsed. Yellow fill inside a black outline -
-// yellow alone on white is 1.6:1, but the outline supplies the edge.
-void drawPrecipitationBar(int16_t x, int16_t y, int16_t width, int16_t height, int percent)
+// A vertical bar whose fill height is the forecast rainfall. The probability is
+// printed beside it, so the two elements carry two different facts - the bar used
+// to be filled by probability with the same probability printed next to it, which
+// spent a whole column element restating one number.
+//
+// The scale is fixed rather than fitted to the days on screen. An auto-fitted bar
+// would make the wettest day a full bar whether it is 0.2 mm or 30 mm, so the
+// height would say nothing on its own and would change meaning between refreshes.
+//
+// It is also deliberately non-linear. Daily rainfall is heavily skewed: most wet
+// days are under 5 mm, so a linear 0-30 mm bar would squash every ordinary day
+// into the bottom sixth and spend most of its height on amounts that almost never
+// occur. Each band below gets an equal share of the bar instead, which expands the
+// range that varies day to day and compresses the tail - and because the band
+// boundaries are also the colour changes, the height and the colour always agree.
+//
+// Colour carries the band, which is what lets the bar be read without a unit label
+// anywhere in the column: yellow is a light day, red a wet one, black an
+// exceptional one. The ramp is monotonic in visual weight, which is the most a
+// four-colour panel can express - there is no room for a smooth gradient, and with
+// 18 usable pixels of height a continuous curve would quantise to these steps anyway.
+struct PrecipitationBand
+{
+  int limitTenths;    // upper bound of the band, in tenths of a mm
+  uint16_t colour;
+};
+
+// 0-2 mm, 2-10 mm, 10-30 mm. Anything past 30 mm pins to a full black bar.
+constexpr PrecipitationBand kPrecipitationBands[] = {
+    {20, TFT_YELLOW},
+    {100, TFT_RED},
+    {300, TFT_BLACK},
+};
+constexpr int kPrecipitationBandCount =
+    sizeof(kPrecipitationBands) / sizeof(kPrecipitationBands[0]);
+
+void drawPrecipitationBar(int16_t x, int16_t y, int16_t width, int16_t height, int mmTenths)
 {
   epaper.drawRect(x, y, width, height, TFT_BLACK);
   const int16_t inner = height - 2;
-  int16_t filled = (inner * constrain(percent, 0, 100)) / 100;
-  if (percent > 0 && filled < 1) {
-    filled = 1;  // never render a non-zero chance as empty
+  if (mmTenths <= 0) {
+    return;  // a dry day is an empty outline
   }
-  if (filled > 0) {
-    epaper.fillRect(x + 1, y + height - 1 - filled, width - 2, filled, TFT_YELLOW);
+
+  // Past the last limit the amount pins to the top band. Deriving the lower bound
+  // from the band index rather than carrying it through the loop matters: letting
+  // the loop run off the end leaves it equal to the upper bound, and the zero span
+  // divides by zero on any day over the top threshold.
+  int band = kPrecipitationBandCount - 1;
+  for (int i = 0; i < kPrecipitationBandCount; ++i) {
+    if (mmTenths <= kPrecipitationBands[i].limitTenths) {
+      band = i;
+      break;
+    }
   }
+  const int lower = (band == 0) ? 0 : kPrecipitationBands[band - 1].limitTenths;
+  const int upper = kPrecipitationBands[band].limitTenths;
+
+  // Position within this band, then within the bar: each band owns an equal slice.
+  const int span = upper - lower;
+  const int withinBand = constrain(mmTenths - lower, 0, span);
+  int16_t filled = static_cast<int16_t>(
+      (inner * (static_cast<long>(band) * span + withinBand)) /
+      (static_cast<long>(kPrecipitationBandCount) * span));
+  if (filled < 1) {
+    filled = 1;  // a trace of rain is not the same as a dry day
+  }
+  if (filled > inner) {
+    filled = inner;
+  }
+  epaper.fillRect(x + 1, y + height - 1 - filled, width - 2, filled,
+                  kPrecipitationBands[band].colour);
 }
 
 // The "modern" design: today as a hero panel on the left, the remaining four days
@@ -2585,7 +2661,7 @@ void drawModernForecast(const ForecastData& forecast)
   // the icon the narrow one wasted the space on the element that could not use it.
   // Icon first: it paints a white background, so drawing it after the temperature
   // would erase the degree ring sitting next to it.
-  drawWeatherIconScaled(today, 48, kStripHeight + 4, 2);
+  drawWeatherIcon80(today, 48, kStripHeight + 4);
 
   const String heroTemp = forecast.currentValid ? String(forecast.currentTemp) : String(today.tempMax);
   // Three characters at 18 pt would reach past x=48 and collide with the icon -
@@ -2641,8 +2717,10 @@ void drawModernForecast(const ForecastData& forecast)
     epaper.setTextColor(TFT_BLACK, TFT_WHITE);
     epaper.drawString(String(day.tempMin), cx + 14, kStripHeight + 70, 1);
 
-    // Bar and figure side by side: stacking them spends height restating one fact.
-    drawPrecipitationBar(cx + 4, kStripHeight + 82, 12, 20, day.precipitationProbability);
+    // Bar is how much, figure is how likely. Two facts in the space that used to
+    // hold one twice over.
+    drawPrecipitationBar(cx + 4, kStripHeight + 82, 12, 20, day.precipitationMm);
+    epaper.setTextColor(TFT_BLACK, TFT_WHITE);
     epaper.drawString(String(day.precipitationProbability) + "%", cx + 19, kStripHeight + 88, 1);
   }
 }
@@ -6043,7 +6121,25 @@ void setup()
 
   if (coldBoot) {
     rtcWakeCount = 0;
-    addLog("JFG PaperCast booting.");
+    // Why the chip restarted, not just that it did. A cold boot is otherwise
+    // indistinguishable between someone pressing reset, the regulator browning
+    // out under the panel's refresh current, and firmware crashing or hanging -
+    // which need completely different fixes.
+    const char* cause = "unknown";
+    switch (esp_reset_reason()) {
+      case ESP_RST_POWERON:  cause = "power-on"; break;
+      case ESP_RST_EXT:      cause = "external reset pin"; break;
+      case ESP_RST_SW:       cause = "software restart"; break;
+      case ESP_RST_PANIC:    cause = "CRASH (panic/exception)"; break;
+      case ESP_RST_INT_WDT:  cause = "interrupt watchdog"; break;
+      case ESP_RST_TASK_WDT: cause = "task watchdog"; break;
+      case ESP_RST_WDT:      cause = "other watchdog"; break;
+      case ESP_RST_BROWNOUT: cause = "BROWNOUT (supply sagged)"; break;
+      case ESP_RST_DEEPSLEEP: cause = "deep sleep wake"; break;
+      case ESP_RST_SDIO:     cause = "SDIO"; break;
+      default: break;
+    }
+    addLog(String("JFG PaperCast booting. Reset reason: ") + cause);
   } else {
     ++rtcWakeCount;
     addLog(String("Woke from deep sleep (cycle ") + rtcWakeCount + ").");

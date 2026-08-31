@@ -101,13 +101,47 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 - 5‑day forecast layout
 - Bold max temperature
 - Compact legend (L = low, P = precipitation **probability**)
-- Weather icons (40×40 sprites, 4bpp palette)
+- Weather icons in a single hand-authored four-colour set, at 80×80 and 40×40
 - **Four selectable header layouts**: large current temperature, city name, both, or neither
 - **Two configurable information lines** — feels‑like + UV, rain in mm, sunrise/sunset, or wind +
   gusts. The first line yields to a weather warning, or to the IP address after a cold boot
 - **Weather warnings** — derived from the forecast, or official DWD warnings via Bright Sky
 - Battery indicator with the charge percentage inside it, and a red strip when it runs low
 - Auto refresh on a configurable interval (default 60 minutes), deep sleeping in between
+
+### Display designs
+
+Two complete designs ship in the firmware. Pick one from **Display** on the web page; the preview
+updates as you choose, so you can compare them before saving. Both are real screenshots taken from
+the device over `/preview.bmp`.
+
+**Modern** — today as a hero panel, the rest of the week compact beside it:
+
+![Modern design](docs/images/design-modern.png)
+
+The hero answers "what is it doing right now" without reading anything: an 80×80 icon, the current
+temperature, and the day's high and low. The status strip carries the location, the update time and
+the battery — and turns yellow with black text when a warning is active. Each day column pairs a
+precipitation **bar** with the **probability** beside it, so the two elements carry two different
+facts rather than restating one.
+
+**Classic** — five equal day cards under a configurable banner:
+
+![Classic design](docs/images/design-classic.png)
+
+Every day gets the same treatment, which is the better choice if you read the whole week rather than
+mostly glancing at today. The banner above it is configurable in the ways described below.
+
+| | Modern | Classic |
+|---|---|---|
+| Today | Hero panel, 80×80 icon | One card among five |
+| Remaining days | 4 compact columns | 4 equal cards |
+| Precipitation | Bar = amount, figure = probability | Text, `P70%` |
+| Banner layouts / presets | Not used — the hero shows more than a preset could | Fully configurable |
+| Best for | Glancing at today | Reading the week |
+
+> The **layout** and **information line** selectors below shape the *classic* banner only. They are
+> hidden when the modern design is selected, because the hero already shows more than any preset.
 
 ### Display layouts
 
@@ -292,7 +326,48 @@ The configuration is stored in NVS and applied on each connection.
 
 ## Weather Icons (4bpp)
 
-Icons are stored as 4‑bit indexed sprites and rendered with:
+Seventeen conditions, drawn for this panel's four colours. The set exists at two sizes — 80×80 for
+the modern hero, 40×40 for the day columns of both designs:
+
+![80×80 icon set](docs/images/icons-80x80.png)
+
+![40×40 icon set](docs/images/icons-40x40.png)
+
+**The two sizes are the same drawing code run at two scales, not one resampled into the other.** A
+2:1 downsample on a palette with no intermediate tones has to decide each output pixel by a block
+vote, which either eats the one-pixel outlines or doubles their weight — there is no anti-aliasing
+to absorb the difference. Redrawing at 40 keeps a true single-pixel outline.
+
+**The style**, and why it is what it is with four inks:
+
+- **White body, black outline, and a lit rim** — a second copy of the shape offset up and left, with
+  the white body drawn over it, leaving a crescent. With no intermediate tones that crescent is the
+  only way to suggest a light source at all.
+- **Rain is black; red means take notice.** Red is reserved for heavy precipitation, storms, hail and
+  freezing rain, so it keeps the same meaning it has in the warning strip and the low-battery
+  marker. Rendering every drizzle in red would spend that signal on nothing.
+- **Yellow is sunlight**, on the sun itself and on the lit rim of a cloud with sun behind it.
+
+### Regenerating them
+
+The icons are generated, not hand-edited. Edit [`tools/gen_icons80.py`](tools/gen_icons80.py) and run:
+
+```bash
+python3 tools/gen_icons80.py     # no dependencies, pure standard library
+```
+
+It rewrites both headers and both preview images. Icons are authored in an 80-unit design space and
+the primitives convert to pixels, which is what lets one definition serve both sizes.
+
+The generator **reports any icon that draws outside its tile** rather than letting it be silently
+truncated. This matters more than it sounds: a cloud's true extent is larger than its nominal size,
+because the outline grows outward and the lit rim sits further up-left again, so art that looks
+safely inside the tile in source coordinates can still lose its crown. Both sizes must report
+`no clipping` before the output is worth flashing.
+
+### Format
+
+4‑bit indexed sprites, two pixels per byte, high nibble first, rendered with:
 
 ```cpp
 epaper.fillRect(x, y, 40, 40, TFT_WHITE);
@@ -329,9 +404,11 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 ```
 .
 ├── src/                     # main app
-├── include/                 # icon headers, config
+├── include/                 # generated icon headers, config
 ├── lib/Seeed_GFX/           # graphics + driver stack
+├── tools/gen_icons80.py     # draws the icon set; rewrites both headers
 ├── docs/                    # detailed guides
+├── docs/images/             # screenshots and icon sheets used by this README
 ├── assets/                  # source images for icons
 ├── platformio.ini
 └── partitions_singleapp.csv

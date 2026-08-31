@@ -198,8 +198,14 @@ that press the estimate drifts further from reality with every cycle.
    # artifact: .pio/build/seeed_xiao_esp32c6/firmware.bin
    ```
 
-2. Open the web page, go to **Firmware Update**, choose the file, press **Upload firmware**.
-3. Watch the progress percentage. The device verifies the image and reboots into it — a ~1.3 MB
+2. **Press reset on the board.** Updates are deliberately something you start, never something
+   the device does on its own — so it has to be awake and listening before you can upload. A
+   reset gives you a 5‑minute window, which is ample. Do not try to catch a scheduled wake
+   instead: those stay up for only 30 seconds and spend about 20 of them redrawing the panel.
+   (If **Keep awake** is already running from the Settings card, skip this — it is already up.)
+
+3. Open the web page, go to **Firmware Update**, choose the file, press **Upload firmware**.
+4. Watch the progress percentage. The device verifies the image and reboots into it — a ~1.3 MB
    image takes about 15 seconds. Deep sleep is suppressed for the whole upload, so it cannot be cut
    short.
 
