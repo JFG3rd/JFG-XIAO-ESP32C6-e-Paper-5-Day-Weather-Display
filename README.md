@@ -34,8 +34,12 @@ with a trailing `?` so a guess never masquerades as a measurement.
 | Shown as | `78%` | `78%?` |
 | Survives a reboot | Yes — the gauge keeps counting | Resets its baseline |
 
+![The gauge fitted, in line with the pack](docs/images/IMG_3211.jpeg)
+
 Four wires to the XIAO, no soldering if you use a STEMMA QT cable. See
-[`docs/wire-diagram.md`](docs/wire-diagram.md) for the step‑by‑step.
+[`docs/wire-diagram.md`](docs/wire-diagram.md) for the step‑by‑step. Note in the photo
+that the cell plugs into the **gauge**, and a second lead carries it on to the driver
+board's `BAT` connector — the gauge has to sit in line with the pack to measure it.
 
 | Gauge | XIAO ESP32‑C6 |
 |---|---|
