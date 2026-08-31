@@ -20,6 +20,45 @@ This project focuses on a reliable, repeatable workflow: correct controller sele
 - **Driver Board**: Seeed Studio XIAO ePaper driver board / expansion board V2  
 - **Panel**: 2.9" BWRY e‑paper, 128×296  
 
+### Optional: Adafruit LC709203F fuel gauge
+
+A [LiPoly / LiIon fuel gauge breakout](https://www.adafruit.com/product/4712) (I²C, address `0x0B`)
+that reports the pack's true voltage and state of charge. **Entirely optional** — without one the
+firmware models the charge from how long it has spent awake and asleep, and marks every such reading
+with a trailing `?` so a guess never masquerades as a measurement.
+
+| | With the gauge | Without it |
+|---|---|---|
+| Percentage | Measured from the cell | Modelled from run time |
+| Voltage | Reported | Not available |
+| Shown as | `78%` | `78%?` |
+| Survives a reboot | Yes — the gauge keeps counting | Resets its baseline |
+
+Four wires to the XIAO, no soldering if you use a STEMMA QT cable. See
+[`docs/wire-diagram.md`](docs/wire-diagram.md) for the step‑by‑step.
+
+| Gauge | XIAO ESP32‑C6 |
+|---|---|
+| `VIN` | `3V3` |
+| `GND` | `GND` |
+| `SDA` | `D4` (GPIO22) |
+| `SCL` | `D5` (GPIO23) |
+
+The battery connects to the **gauge**, and the gauge passes it through to the driver board — it has
+to sit in line with the pack to measure it. Set your real pack size on the web page (**Settings →
+Battery size**); the relevant firmware settings are `kBatteryGaugeEnabled`, `kBatteryProfile` and
+`kBatteryThermistorB` in [`include/weather_config.h`](include/weather_config.h).
+
+> **Set `kBatteryProfile` to match your cell.** `0` is an ordinary 3.7 V / 4.2 V LiPo — including
+> every cell Adafruit sells — and `1` is a 3.8 V / 4.35 V high‑voltage cell. The Adafruit library's
+> own `begin()` writes `1` under a comment claiming it is the 4.2 V profile, so a standard cell left
+> on the library default is measured against a curve for a pack that charges 150 mV higher: it never
+> reaches 100 % and reads low across the whole range. This firmware sets the profile explicitly.
+
+**If the readings look wrong**, open `http://<device-ip>/batteryProbe`. It scans the I²C bus and
+dumps the gauge's registers, which separates a wiring fault (nothing answers) from a configuration
+fault (it answers, but with implausible numbers).
+
 ## Software Stack
 
 - PlatformIO
