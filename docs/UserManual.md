@@ -4,25 +4,19 @@ A 5‑day weather display on a 2.9" 4‑colour e‑paper panel, driven by a Seee
 on a timer, fetches a forecast, redraws the panel and goes back to sleep — everything else is
 configured from a web page it serves itself.
 
-For build and hardware notes see [README.md](README.md). This document is about *using* it.
+For build and hardware notes see [README.md](../README.md). This document is about *using* it.
 
 ---
 
 ## 1. What the display shows
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  26°        WiFi: MBUmain 192.168.178.222            [ 95 ]  │  ← banner
-│             Sun 06:12-20:02                                  │
-│             Updated: SAT 29/08 16:18                         │
-├──────────┬──────────┬──────────┬──────────┬──────────────────┤
-│   SAT    │   SUN    │   MON    │   TUE    │   WED            │
-│   ☁      │   ☀      │   ☀      │   ☀      │   ☁              │
-│  CLOUD   │ SHOWERS  │ SHOWERS  │ SHOWERS  │  CLOUD           │
-│   26°    │   25°    │   25°    │   22°    │   24°            │
-│ L18° P35%│ L18° P25%│ L18° P70%│ L16° P14%│ L14° P17%        │
-└──────────┴──────────┴──────────┴──────────┴──────────────────┘
-```
+Two designs ship in the firmware. Pick one from **Design** on the web page: *Classic — five equal
+days*, or *Modern — today large*. The preview updates as you choose, so you can compare them before
+saving.
+
+### 1.1 Classic — five equal days
+
+![Classic design](images/design-classic2.jpg)
 
 **The banner** carries a left element (configurable — see §4), up to two information lines, the time
 of the last update, and a battery indicator. **The five cards** are the forecast: weekday, an icon,
@@ -34,6 +28,73 @@ identical on the cards, which is why the `Rain in mm` header preset exists — i
 
 **The battery indicator** shows the charge as a bar with the percentage inside it. A trailing `?`
 (e.g. `79?`) means the value is *estimated* from run time rather than measured — see §5.
+
+### 1.2 Modern — today large
+
+![Modern design](images/design-modern.png)
+
+Today gets a hero panel on the left; the remaining four days are compact columns on the right. It
+answers "what is it doing right now" without reading anything, which five identical cards cannot.
+
+**The status strip** across the top carries the location on the left, the day and time of the last
+update on the right, and the battery indicator in the corner. It is normally black with yellow text.
+When a weather warning is active the strip **inverts to yellow with black text** and the warning
+replaces both the location and the timestamp — the colour swap is itself the signal. After a cold
+boot, or when the IP address has changed, the strip shows the **IP address** in place of the
+location, exactly as the classic banner does.
+
+**The hero — today:**
+
+- `NOW`, then the **current temperature** in large red type with a degree ring. Until the first
+  current reading arrives it falls back to today's high, and it steps down a size for three-character
+  numbers so `100` or `-5` cannot collide with the icon.
+- An 80×80 condition icon.
+- ▲ in red is today's **high**; ▼ in black is today's **low**.
+- Below them, the condition label for today.
+- The bottom line is today's total rainfall as an **amount** (`2.4mm`), then ▲ **sunrise** and
+  ▼ **sunset**.
+
+Note that the hero gives rainfall as an amount only — there is no probability figure on it. The
+percentages on this design belong to the day columns.
+
+**The four day columns**, right of the divider: weekday, a 40×40 icon, ▲ red high, ▼ black low, and
+then the precipitation pair described next.
+
+#### Reading the precipitation bar and the percentage
+
+Each day column pairs a **bar** with a **percentage**, and they carry two different facts rather
+than restating one:
+
+- **The bar is how much** — the forecast rainfall amount.
+- **The percentage is how likely** — the chance of any precipitation at all.
+
+So `90%` beside an almost-empty bar is a day that will very probably drizzle, while `40%` beside a
+tall red bar is a day that will probably stay dry — but soaks you if it doesn't. The two are worth
+reading together; neither alone tells you whether to take a coat.
+
+**The bar carries no unit label.** Its colour and its height are the scale, and they always agree,
+because the colour changes exactly where the height steps:
+
+| The bar | Rainfall |
+|---|---|
+| Empty outline | Dry — no rain forecast |
+| Yellow, in the lower third | Up to 2 mm — light |
+| Red, into the middle third | 2–10 mm — wet |
+| Black, into the top third | 10–30 mm — heavy |
+| Full black | 30 mm or more — pinned at the top |
+
+**The scale is deliberately not linear.** Each of the three bands gets an equal third of the bar's
+height. Daily rainfall is heavily skewed toward small amounts: on a straight 0–30 mm scale almost
+every real day would sit squashed into the bottom sixth, and most of the bar would be spent on
+amounts that hardly ever occur.
+
+The cost of that choice is worth knowing: **the bar is for comparing days at a glance, not for
+reading a value off.** Near the bottom, 1 mm and 2 mm sit close together, while the entire 10–30 mm
+range shares the top third. A trace of rain always fills **at least one pixel**, so "a little" never
+looks identical to "none".
+
+The classic design states the same two facts as text instead: `P` on each card is the probability,
+and the `Rain in mm` header preset gives the amount (see §4).
 
 ---
 
@@ -88,8 +149,8 @@ can see the preset you are choosing rather than the IP address.
 Press **Reload preview** to go back to what is physically on the panel.
 
 ### Settings
-Location, time zone, layout, the two header lines, warnings, units, **battery size**, quiet hours and
-the low‑battery threshold. Press **Save** to apply them together. The form is filled from the device when the page
+**Design** (see §1), location, time zone, layout, the two header lines, warnings, units, **battery
+size**, quiet hours and the low‑battery threshold. Press **Save** to apply them together. The form is filled from the device when the page
 loads and then left alone, so it will not overwrite something you are part‑way through changing.
 
 ### Firmware Update
@@ -102,6 +163,9 @@ entries, so it scrolls quickly during a busy refresh.
 ---
 
 ## 4. Display options
+
+Everything in this section shapes the **classic** banner. The selectors are hidden when the modern
+design is chosen, because its hero already shows more than any preset could.
 
 **Layout** chooses the left of the banner:
 
@@ -186,10 +250,8 @@ that press the estimate drifts further from reality with every cycle.
 ### Optional hardware: Adafruit LC709203F fuel gauge
 
 [Adafruit LiPoly / LiIon Fuel Gauge, product 4712](https://www.adafruit.com/product/4712). An I²C
-part at address `0x0B` that measures the cell directly instead of guessing from run time. The
-display works perfectly well without it — this buys accuracy, not function.
-
-**What it changes**
+part at address `0x0B`. The display works perfectly well without it — this buys accuracy, not
+function. At a glance:
 
 | | With the gauge | Without it |
 |---|---|---|
@@ -199,8 +261,10 @@ display works perfectly well without it — this buys accuracy, not function.
 | After a reboot | Keeps counting | Baseline resets |
 | "Battery charged" button | Optional calibration | Required after every charge |
 
-**Fitting it** — four wires, no soldering with a STEMMA QT cable. Full steps in
-[docs/wire-diagram.md](docs/wire-diagram.md).
+**Fitting it** — four wires, no soldering with a STEMMA QT cable. The battery plugs into the
+**gauge**, which passes it through to the driver board: it has to sit in line with the pack to
+measure it, and wiring it as a bystander on the I²C bus reads nothing. Full steps in
+[wire-diagram.md](wire-diagram.md).
 
 | Gauge pin | XIAO ESP32‑C6 |
 |---|---|
@@ -208,9 +272,6 @@ display works perfectly well without it — this buys accuracy, not function.
 | `GND` | `GND` |
 | `SDA` | `D4` (GPIO22) |
 | `SCL` | `D5` (GPIO23) |
-
-The battery plugs into the **gauge**, which passes it through to the driver board. It has to sit in
-line with the pack to measure it — wiring it as a bystander on the I²C bus reads nothing.
 
 Afterwards, set your real pack size under **Settings → Battery size**, then charge the cell fully
 and press **Battery charged** once. That both zeroes the model and re‑seeds the gauge's own state of

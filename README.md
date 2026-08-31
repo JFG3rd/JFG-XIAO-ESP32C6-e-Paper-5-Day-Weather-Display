@@ -5,6 +5,16 @@ This project focuses on a reliable, repeatable workflow: correct controller sele
 
 ![XIAO e‑paper weather display](docs/images/PaperCast_Hardware_GreenBG.jpg)
 
+## Why I Built This Project
+
+This started as a personal engineering challenge — like
+[SpectraLab-P4](https://github.com/JFG3rd/SpectraLab-P4) — while I was being treated for acute
+myeloid leukemia (AML). During long hospital stays I wanted something real to build: work I could
+pick up and put down around treatment, and that would still be waiting when I came back to it.
+
+Engineering has always been how I make sense of complicated problems, and this project kept me
+learning through a very different kind of one.
+
 ## Why This Is Worth Building
 
 - **Always‑on, almost‑no‑power**: e‑paper only consumes power while refreshing.
@@ -48,10 +58,9 @@ board's `BAT` connector — the gauge has to sit in line with the pack to measur
 | `SDA` | `D4` (GPIO22) |
 | `SCL` | `D5` (GPIO23) |
 
-The battery connects to the **gauge**, and the gauge passes it through to the driver board — it has
-to sit in line with the pack to measure it. Set your real pack size on the web page (**Settings →
-Battery size**); the relevant firmware settings are `kBatteryGaugeEnabled`, `kBatteryProfile` and
-`kBatteryThermistorB` in [`include/weather_config.h`](include/weather_config.h).
+Set your real pack size on the web page (**Settings → Battery size**); the relevant firmware settings
+are `kBatteryGaugeEnabled`, `kBatteryProfile` and `kBatteryThermistorB` in
+[`include/weather_config.h`](include/weather_config.h).
 
 > **Set `kBatteryProfile` to match your cell.** `0` is an ordinary 3.7 V / 4.2 V LiPo — including
 > every cell Adafruit sells — and `1` is a 3.8 V / 4.35 V high‑voltage cell. The Adafruit library's
@@ -79,17 +88,14 @@ Install PlatformIO Core or use the PlatformIO IDE extension.
 
 ### 2) Build & Flash
 
-```bash
-platformio run -t upload -e seeed_xiao_esp32c6
-```
-
-`esptool` cannot sync with this board, so the first flash goes over the chip's built‑in JTAG:
+`esptool` cannot sync with this board, so the flash goes over the chip's built‑in JTAG:
 
 ```bash
 PLATFORMIO_UPLOAD_PROTOCOL=esp-builtin pio run -e seeed_xiao_esp32c6 -t upload
 ```
 
-After that, update over the air from the web UI — see [UserManual.md](UserManual.md#6-firmware-updates).
+After that, update over the air from the web UI — see
+[UserManual.md](docs/UserManual.md#6-firmware-updates).
 
 ### 3) First Boot Setup
 
@@ -154,7 +160,7 @@ The Seeed_GFX combo `512` + `USE_XIAO_EPAPER_DRIVER_BOARD` matches this exactly.
 
 ### Display designs
 
-Two complete designs ship in the firmware. Pick one from **Display** on the web page; the preview
+Two complete designs ship in the firmware. Pick one from **Design** on the web page; the preview
 updates as you choose, so you can compare them before saving. Both are real screenshots taken from
 the device over `/preview.bmp`.
 
@@ -241,7 +247,7 @@ Open the control page at `http://<device-ip>/`:
 - Deep sleep on/off toggle
 - Logs and status
 
-**Full walkthrough: [UserManual.md](UserManual.md).**
+**Full walkthrough: [UserManual.md](docs/UserManual.md).**
 
 ---
 
@@ -302,17 +308,26 @@ always shown **with a trailing `?`** — `79?` on the panel, `79% ~estimated` on
 estimate is never mistaken for a measurement.
 
 Because the model cannot detect charging, it needs an explicit zero point: press
-**"Battery charged"** in the web UI after every charge to reset it to 100 %. The relevant constants
+**"Battery charged"** in the web UI after every charge to reset it to 100 %. The model's constants
 (`kBatteryCapacityMah`, `kEstimatedActiveMa`, `kEstimatedSleepUa`) live in
 [include/weather_config.h](include/weather_config.h).
 
+Modelling it is the only option on this hardware: the driver board never routes `BAT_4V2` to the
+XIAO (schematic rev 1.0 — it reaches only the power switch, the ETA9740 charger and the JST BAT
+connector), and on the ESP32‑C6 the only ADC‑capable pins (D0/A0, D1/A1, D2/A2) are already used by
+the panel for RST, CS and BUSY, while D4–D7 have no ADC at all.
+
 **Battery size** is chosen in the web UI rather than compiled in, so this firmware suits whatever
-cell you fit. It sets both the gauge's discharge profile (snapped to the nearest of the six the
-LC709203F supports) and the capacity the modelled estimate divides by.
+cell you fit. It sets both the gauge's discharge profile (`kBatteryPackMah`, snapped to the nearest
+of the six the LC709203F supports) and the real capacity the modelled estimate divides by
+(`kBatteryCapacityMah`, which is not restricted to those six values).
 
 Fit an **Adafruit LC709203F** on the free D4/D5 pins and it takes over automatically, with real
 voltage and state‑of‑charge and no `?`. Wiring and bring‑up:
-**[docs/wire-diagram.md](docs/wire-diagram.md)**.
+**[docs/wire-diagram.md](docs/wire-diagram.md)**. The rest of its configuration
+(`kBatteryGaugeEnabled`, `kBatteryThermistorB`, `kBatteryLowPercent` and the I²C pins) is in the same
+header. The gauge is left in operating mode across deep sleep (~15 µA) so its state‑of‑charge
+tracking keeps running while the MCU is asleep; `initRSOC()` is only re‑seeded on a cold boot.
 
 ### Panel resilience
 
@@ -325,20 +340,7 @@ the web UI is still there to diagnose with. `GET /panelProbe` re‑tests the pan
 reports the BUSY line's electrical state — `busyFloating=0, busyPullup=1` means nothing is driving
 the line at all, which points at the FPC connector rather than firmware.
 
-There is no alternative on this hardware: the driver board never routes `BAT_4V2` to the XIAO
-(schematic rev 1.0 — it reaches only the power switch, the ETA9740 charger and the JST BAT
-connector), and on the ESP32‑C6 the only ADC‑capable pins (D0/A0, D1/A1, D2/A2) are already used by
-the panel for RST, CS and BUSY, while D4–D7 have no ADC at all.
-
-The gauge is fitted and reporting real values. Without one, the firmware falls back to a **modelled**
-estimate integrated from awake/asleep time, always shown with a trailing **`?`** so a guess is never
-mistaken for a measurement; that mode needs the web UI's **Battery charged** button as its zero point
-after each charge.
-
-Configuration lives in [include/weather_config.h](include/weather_config.h) (`kBatteryGaugeEnabled`,
-`kBatteryPackMah`, `kBatteryThermistorB`, `kBatteryLowPercent`, and the I²C pins). The gauge is left
-in operating mode across deep sleep (~15 µA) so its state‑of‑charge tracking keeps running while the
-MCU is asleep; `initRSOC()` is only re‑seeded on a cold boot.
+---
 
 ## Language Selection
 
@@ -463,7 +465,8 @@ void drawDegreeSymbol(int16_t x, int16_t y, uint8_t radius, uint16_t color) {
 
 - `docs/EPAPER_2IN9_BWRY_XIAO_GUIDE.md`
 - `docs/WEATHER_FORECAST_APP.md`
-- `UserManual.md` — using the device: setup, settings, OTA updates, troubleshooting
+- [`docs/UserManual.md`](docs/UserManual.md) — using the device: setup, settings, OTA updates,
+  troubleshooting
 - `docs/wire-diagram.md` — LC709203F fuel gauge wiring, step by step
 
 ---
